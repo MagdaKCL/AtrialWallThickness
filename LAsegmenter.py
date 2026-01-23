@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Left Atrium Segmenter - Version 19
+Left Atrium Segmenter - Version 906
 Based on v17 with two fixes:
 - MA region smaller: bounded by the 3 picked points, not extending beyond them
 - Lateral wall: moved to between LAA/LIPV and MA (not left of LSPV/LIPV)
