@@ -27,15 +27,15 @@ class LASegmenter:
         self.default_ostium_radius = 10.0
         
         self.landmark_sequence = [
+            ('MA', 'point1', 'MITRAL ANNULUS - MA1: First point on major axis'),
+            ('MA', 'point2', 'MITRAL ANNULUS - MA2: Second point on major axis'),
+            ('MA', 'point3', 'MITRAL ANNULUS - MA3: First point on minor axis'),
+            ('MA', 'point4', 'MITRAL ANNULUS - MA4: Second point on minor axis'),
             ('RSPV', 'vein', 'RSPV - Click TIP, then position cutting plane'),
             ('LSPV', 'vein', 'LSPV - Click TIP, then position cutting plane'),
             ('RIPV', 'vein', 'RIPV - Click TIP, then position cutting plane'),
             ('LIPV', 'vein', 'LIPV - Click TIP, then position cutting plane'),
             ('LAA', 'vein', 'LAA - Click TIP, then position cutting plane'),
-            ('MA', 'point1', 'MITRAL ANNULUS - MA1: First point on major axis'),
-            ('MA', 'point2', 'MITRAL ANNULUS - MA2: Second point on major axis'),
-            ('MA', 'point3', 'MITRAL ANNULUS - MA3: First point on minor axis'),
-            ('MA', 'point4', 'MITRAL ANNULUS - MA4: Second point on minor axis'),
         ]
         
         self.colors = {
@@ -264,6 +264,8 @@ class LASegmenter:
         
         return actor, edge_actor
     
+
+    
     def select_landmarks_interactive(self):
         print("\n" + "="*60)
         print("  LANDMARK SELECTION")
@@ -298,7 +300,10 @@ class LASegmenter:
             'plane_pos': None, 'plane_normal': None, 'radius': self.default_ostium_radius,
             'offset': 0, 'tilt_fb': 0, 'tilt_lr': 0,
             'marker': None, 'ring': None, 'disk': None, 'permanent': [],
-            'ma_point_id': None, 'ma_coords': None, 'done': False
+            'ma_point_id': None, 'ma_coords': None, 'done': False,
+            'regions': np.zeros(len(self.points), dtype=int), 'region_actor': None,
+            'exit_reason': None,  # Track why we're exiting
+            'review_mode': False   # Track if we're reviewing a landmark
         }
         
         text = vtk.vtkTextActor()
@@ -316,6 +321,36 @@ class LASegmenter:
         def update_text():
             region, ltype, desc = self.landmark_sequence[state['idx']]
             text.SetInput(f"[{state['idx']+1}/{len(self.landmark_sequence)}] {desc}")
+        
+        def update_region_visualization():
+            """Update the 3D visualization to show current regions"""
+            if state['region_actor']:
+                renderer.RemoveActor(state['region_actor'])
+                state['region_actor'] = None
+            
+            # Create colored mesh based on regions
+            region_colors = vtk.vtkUnsignedCharArray()
+            region_colors.SetNumberOfComponents(3)
+            region_colors.SetName("Colors")
+            
+            for vid in range(len(self.points)):
+                rid = state['regions'][vid]
+                color = self.extended_color_map.get(rid, (200, 200, 200))
+                region_colors.InsertNextTuple3(int(color[0]), int(color[1]), int(color[2]))
+            
+            self.mesh.GetPointData().SetScalars(region_colors)
+            
+            mapper = vtk.vtkPolyDataMapper()
+            mapper.SetInputData(self.mesh)
+            mapper.SetScalarModeToUsePointData()
+            
+            region_actor = vtk.vtkActor()
+            region_actor.SetMapper(mapper)
+            renderer.RemoveActor(actor)  # Remove the original gray actor
+            renderer.AddActor(region_actor)
+            state['region_actor'] = region_actor
+            window.Render()
+
         
         def update_info():
             if state['plane_pos'] is not None:
@@ -397,6 +432,10 @@ class LASegmenter:
             window.Render()
         
         def on_click(obj, event):
+            # Don't process clicks during review mode
+            if state['review_mode']:
+                return
+            
             pos = interactor.GetEventPosition()
             picker = vtk.vtkCellPicker()
             picker.SetTolerance(0.005)
@@ -435,7 +474,20 @@ class LASegmenter:
                 state['marker'].GetProperty().SetColor(1, 1, 1)
                 renderer.AddActor(state['marker'])
                 
-                update_plane()
+                # Get camera vectors to pass to update_plane
+                camera = renderer.GetActiveCamera()
+                cam_pos = np.array(camera.GetPosition())
+                cam_focal = np.array(camera.GetFocalPoint())
+                cam_view = cam_focal - cam_pos
+                cam_view = cam_view / np.linalg.norm(cam_view)
+                cam_up_raw = np.array(camera.GetViewUp())
+                cam_up = cam_up_raw / np.linalg.norm(cam_up_raw)
+                cam_right = np.cross(cam_view, cam_up)
+                cam_right = cam_right / np.linalg.norm(cam_right)
+                cam_up = np.cross(cam_right, cam_view)
+                cam_up = cam_up / np.linalg.norm(cam_up)
+                
+                update_plane(cam_right=cam_right, cam_up=cam_up)
                 text.SetInput(f"[{state['idx']+1}/{len(self.landmark_sequence)}] WSAD=tilt, IJKL=move, UP/DOWN=offset, SPACE=confirm")
                 text.GetTextProperty().SetColor(0, 1, 0)
             else:
@@ -463,6 +515,231 @@ class LASegmenter:
         def on_key(obj, event):
             key = interactor.GetKeySym()
             region, ltype, desc = self.landmark_sequence[state['idx']]
+            
+            # Handle review mode key presses
+            if state['review_mode']:
+                if key == 'space':
+                    # Accept the current landmark
+                    state['review_mode'] = False
+                    print(f"DEBUG: Review mode SPACE - idx={state['idx']}, tip_id={state['tip_id']}")
+                    
+                    # If reviewing MA region (entered after idx=3), move to RSPV selection
+                    # MA review is entered with idx=4, which is RSPV in landmark_sequence
+                    # After accepting MA, we stay at idx=4 to start RSPV selection
+                    if state['idx'] == 4:
+                        # Check if we were reviewing MA or selecting RSPV
+                        # If we just came from MA acceptance, we'll be selecting RSPV (no state vars set yet)
+                        # If we confirmed RSPV plane, we'll have state['tip_id'] set
+                        if state['tip_id'] is None:
+                            # Just accepted MA review, now ready for RSPV selection
+                            update_text()
+                            text.GetTextProperty().SetColor(1, 1, 0)
+                            window.Render()
+                        else:
+                            # Just accepted RSPV review, move to LSPV
+                            state['idx'] += 1
+                            state['tip_id'] = None
+                            state['tip_pos'] = None
+                            state['plane_pos'] = None
+                            state['plane_normal'] = None
+                            state['base_normal'] = None
+                            state['radius'] = self.default_ostium_radius
+                            state['offset'] = 0
+                            state['tilt_fb'] = 0
+                            state['tilt_lr'] = 0
+                            if state['marker']:
+                                renderer.RemoveActor(state['marker'])
+                                state['marker'] = None
+                            if state['ring']:
+                                renderer.RemoveActor(state['ring'])
+                                state['ring'] = None
+                            if state['disk']:
+                                renderer.RemoveActor(state['disk'])
+                                state['disk'] = None
+                            update_text()
+                            text.GetTextProperty().SetColor(1, 1, 0)
+                            window.Render()
+                    # If reviewing a PV (idx 5-7: RSPV, LSPV, RIPV, LIPV), move to next
+                    elif state['idx'] >= 5 and state['idx'] <= 7:
+                        print(f"DEBUG: Accepting PV review - idx={state['idx']} -> {state['idx']+1}")
+                        state['idx'] += 1
+                        print(f"DEBUG: After increment, idx={state['idx']}")
+                        # Reset PV state variables for next PV selection
+                        state['tip_id'] = None
+                        state['tip_pos'] = None
+                        state['plane_pos'] = None
+                        state['plane_normal'] = None
+                        state['base_normal'] = None
+                        state['radius'] = self.default_ostium_radius
+                        state['offset'] = 0
+                        state['tilt_fb'] = 0
+                        state['tilt_lr'] = 0
+                        if state['marker']:
+                            renderer.RemoveActor(state['marker'])
+                            state['marker'] = None
+                        if state['ring']:
+                            renderer.RemoveActor(state['ring'])
+                            state['ring'] = None
+                        if state['disk']:
+                            renderer.RemoveActor(state['disk'])
+                            state['disk'] = None
+                        update_text()
+                        text.GetTextProperty().SetColor(1, 1, 0)
+                        window.Render()
+                    # If reviewing LAA (idx=8), we're done
+                    elif state['idx'] == 8:
+                        text.SetInput("✓ ALL LANDMARKS SELECTED! Close window.")
+                        text.GetTextProperty().SetColor(0, 1, 0)
+                        window.Render()
+                        print("\n✓ All landmarks selected!")
+                        state['exit_reason'] = 'all_done'
+                        window.Finalize()
+                        interactor.TerminateApp()
+                    return
+                elif key == 'Escape':
+                    # Undo the current landmark
+                    if state['idx'] == 4:
+                        # Check if we're undoing MA or RSPV (both at idx=4)
+                        if state['tip_id'] is None:
+                            # Undo MA - delete MA region and all MA markers
+                            print("Undoing MA selection...")
+                            # Reset MA region (region_id 5 for MA)
+                            state['regions'][state['regions'] == 5] = 0
+                            
+                            # Remove MA markers from display
+                            for permanent_actor in state['permanent']:
+                                renderer.RemoveActor(permanent_actor)
+                            state['permanent'] = []
+                            
+                            # Reset to idx 0 to re-select MA points
+                            state['idx'] = 0
+                            state['ma_point_id'] = None
+                            state['ma_coords'] = None
+                            if state['marker']:
+                                renderer.RemoveActor(state['marker'])
+                                state['marker'] = None
+                            
+                            state['review_mode'] = False
+                            update_text()
+                            text.GetTextProperty().SetColor(1, 1, 0)
+                            update_region_visualization()
+                            window.Render()
+                        else:
+                            # Undo RSPV - delete RSPV region and markers
+                            region = 'RSPV'
+                            print(f"Undoing {region} selection...")
+                            
+                            # Reset PV region (RSPV = 1)
+                            state['regions'][state['regions'] == 1] = 0
+                            
+                            # Remove ostium region (RSPV_Ostium = 13)
+                            state['regions'][state['regions'] == 13] = 0
+                            
+                            # Remove the marker and ring from permanent list (last 2 actors added for RSPV)
+                            if state['permanent']:
+                                if len(state['permanent']) >= 2:
+                                    # Remove last 2: ring and marker
+                                    removed_ring = state['permanent'].pop()
+                                    removed_marker = state['permanent'].pop()
+                                    renderer.RemoveActor(removed_ring)
+                                    renderer.RemoveActor(removed_marker)
+                                elif len(state['permanent']) >= 1:
+                                    # Remove last 1: marker
+                                    removed_marker = state['permanent'].pop()
+                                    renderer.RemoveActor(removed_marker)
+                            
+                            # Reset PV state variables (stay at idx=4 to re-select RSPV)
+                            state['tip_id'] = None
+                            state['tip_pos'] = None
+                            state['plane_pos'] = None
+                            state['plane_normal'] = None
+                            state['base_normal'] = None
+                            state['radius'] = self.default_ostium_radius
+                            state['offset'] = 0
+                            state['tilt_fb'] = 0
+                            state['tilt_lr'] = 0
+                            
+                            if state['marker']:
+                                renderer.RemoveActor(state['marker'])
+                                state['marker'] = None
+                            if state['ring']:
+                                renderer.RemoveActor(state['ring'])
+                                state['ring'] = None
+                            if state['disk']:
+                                renderer.RemoveActor(state['disk'])
+                                state['disk'] = None
+                            
+                            # Stay at idx=4 to re-select RSPV
+                            state['review_mode'] = False
+                            update_text()
+                            text.GetTextProperty().SetColor(1, 1, 0)
+                            update_region_visualization()
+                            window.Render()
+                    elif state['idx'] >= 5 and state['idx'] <= 9:
+                        # Undo PV - delete PV region and markers
+                        region = self.landmark_sequence[state['idx']][0]
+                        print(f"Undoing {region} selection...")
+                        
+                        # Reset PV region
+                        pv_region_id = {'RSPV': 1, 'LSPV': 2, 'RIPV': 3, 'LIPV': 4, 'LAA': 6}[region]
+                        state['regions'][state['regions'] == pv_region_id] = 0
+                        
+                        # Remove ostium region (LAA has no ostium)
+                        if region != 'LAA':
+                            ostium_region_id = {'RSPV': 13, 'LSPV': 14, 'RIPV': 15, 'LIPV': 16}[region]
+                            if ostium_region_id in state['regions']:
+                                state['regions'][state['regions'] == ostium_region_id] = 0
+                        
+                        # Remove the marker and ring from permanent list (last 2 actors added for this PV)
+                        # Note: disk was removed from renderer immediately and not added to permanent
+                        to_remove_count = 0
+                        if state['permanent']:
+                            # Check if last actor is the ring (was it added?)
+                            if len(state['permanent']) >= 2:
+                                # Remove last 2: ring and marker
+                                removed_ring = state['permanent'].pop()
+                                removed_marker = state['permanent'].pop()
+                                renderer.RemoveActor(removed_ring)
+                                renderer.RemoveActor(removed_marker)
+                                to_remove_count = 2
+                            elif len(state['permanent']) >= 1:
+                                # Remove last 1: marker
+                                removed_marker = state['permanent'].pop()
+                                renderer.RemoveActor(removed_marker)
+                                to_remove_count = 1
+                        
+                        # Remove ring and disk if they exist in current state
+                        if state['ring']:
+                            renderer.RemoveActor(state['ring'])
+                            state['ring'] = None
+                        if state['disk']:
+                            renderer.RemoveActor(state['disk'])
+                            state['disk'] = None
+                        
+                        # Reset PV state variables
+                        state['tip_id'] = None
+                        state['tip_pos'] = None
+                        state['plane_pos'] = None
+                        state['plane_normal'] = None
+                        state['base_normal'] = None
+                        state['radius'] = self.default_ostium_radius
+                        state['offset'] = 0
+                        state['tilt_fb'] = 0
+                        state['tilt_lr'] = 0
+                        
+                        if state['marker']:
+                            renderer.RemoveActor(state['marker'])
+                            state['marker'] = None
+                        
+                        # Stay at same idx to re-select same PV (don't decrement)
+                        state['review_mode'] = False
+                        update_text()
+                        text.GetTextProperty().SetColor(1, 1, 0)
+                        update_region_visualization()
+                        window.Render()
+                    return
+                else:
+                    return  # Ignore other keys in review mode
             
             if ltype == 'vein' and state['plane_pos'] is not None:
                 # Get camera vectors for viewport-relative controls
@@ -632,8 +909,22 @@ class LASegmenter:
                         renderer.RemoveActor(state['disk'])
                         state['disk'] = None
                     
-                    state['tip_id'] = None
+                    # NOTE: Keep state['tip_id'] set so on_key handler can distinguish PV review from MA review
+                    # state['tip_id'] will be cleared when accepting PV review in on_key handler
                     state['plane_pos'] = None
+                    
+                    # After confirming a PV, enter review mode in the same window
+                    if region in ['RSPV', 'LSPV', 'RIPV', 'LIPV', 'LAA']:
+                        print(f"\nCreating {region} region and ostium...")
+                        self.create_pv_regions(state['regions'], region)
+                        update_region_visualization()
+                        
+                        # Enter review mode - just change key bindings
+                        state['review_mode'] = True
+                        text.SetInput(f"{region} REVIEW: SPACE=accept, ESC=undo")
+                        text.GetTextProperty().SetColor(0, 1, 1)
+                        window.Render()
+                        return
                     
                 elif ltype != 'vein' and state['ma_coords'] is not None:
                     self.markers[f"{region}_{ltype}"] = {
@@ -649,11 +940,27 @@ class LASegmenter:
                     
                     state['ma_point_id'] = None
                     state['ma_coords'] = None
+                    
+                    # Increment idx only for MA points, not PVs
+                    # PV idx increment happens when accepting review
+                    state['idx'] += 1
                 else:
                     return
                 
-                state['idx'] += 1
                 info.SetInput("")
+                
+                # After confirming 4th MA point, enter review mode in same window
+                if state['idx'] == 4:
+                    print("\nComputing MA region...")
+                    self.create_ma_region(state['regions'])
+                    update_region_visualization()
+                    
+                    # Enter MA review mode - just change key bindings
+                    state['review_mode'] = True
+                    text.SetInput("MA REVIEW: SPACE=accept, ESC=undo")
+                    text.GetTextProperty().SetColor(0, 1, 1)
+                    window.Render()
+                    return
                 
                 if state['idx'] < len(self.landmark_sequence):
                     update_text()
@@ -664,12 +971,14 @@ class LASegmenter:
                         renderer.GetActiveCamera().SetFocalPoint(0, 0, 0)
                     window.Render()
                 else:
-                    text.SetInput("✓ ALL DONE! Close window.")
+                    text.SetInput("✓ ALL LANDMARKS SELECTED! Close window.")
                     text.GetTextProperty().SetColor(0, 1, 0)
                     window.Render()
                     print("\n✓ All landmarks selected!")
+                    state['exit_reason'] = 'all_done'
                     window.Finalize()
                     interactor.TerminateApp()
+                    return
         
         update_text()
         interactor.AddObserver('LeftButtonPressEvent', on_click)
@@ -679,6 +988,17 @@ class LASegmenter:
         interactor.Initialize()
         window.Render()
         interactor.Start()
+        
+        # Check why we exited
+        if state['exit_reason'] == 'MA':
+            return state['regions'], 'MA'
+        elif state['exit_reason'] == 'all_done':
+            return state['regions'], None
+        elif state['exit_reason'] is not None:
+            # A PV was selected
+            return state['regions'], state['exit_reason']
+        else:
+            return state['regions'], None
     
     def compute_geodesic_distance_from_set(self, source_verts):
         """Compute geodesic distance from a set of source vertices using multi-source Dijkstra"""
@@ -853,86 +1173,31 @@ class LASegmenter:
             if changed == 0:
                 break
     
-    def define_regions(self):
-        """Define regions with improved straight-line boundaries"""
-        print("\n" + "="*60)
-        print("  COMPUTING REGIONS")
-        print("="*60)
+    def create_ma_region(self, regions):
+        """Create MA region from MA points. Returns ellipse_center for later use."""
+        print("\n1. Creating MA region...")
         
-        regions = np.zeros(len(self.points), dtype=int)
-        mesh_center = np.mean(self.points, axis=0)
-        
-        # Get landmark positions
-        rspv_c = self.markers['RSPV_ostium']['coords']
-        lspv_c = self.markers['LSPV_ostium']['coords']
-        ripv_c = self.markers['RIPV_ostium']['coords']
-        lipv_c = self.markers['LIPV_ostium']['coords']
-        laa_c = self.markers['LAA_ostium']['coords']
-        
-        ma_p1 = self.markers['MA_point1']['coords']
-        ma_p2 = self.markers['MA_point2']['coords']
-        ma_p3 = self.markers['MA_point3']['coords']
-        ma_p4 = self.markers['MA_point4']['coords']
-        
-        # =====================================================
-        # 1. Define PV regions (limited to single outpouching)
-        # =====================================================
-        print("\n1. Vein regions (single outpouching)...")
-        for pv, rid in [('RSPV', 1), ('LSPV', 2), ('RIPV', 3), ('LIPV', 4), ('LAA', 6)]:
-            ost = self.markers[f'{pv}_ostium']
-            center, normal, radius = ost['coords'], ost['normal'], ost['radius']
-            tip_id = self.markers[f'{pv}_distal']['point_id']
-            distal_pt = self.points[tip_id]
-            distal_side = np.sign(np.dot(distal_pt - center, normal))
-            
-            # Find candidates on distal side
-            candidates = np.zeros(len(self.points), dtype=bool)
-            for i, pt in enumerate(self.points):
-                if np.sign(np.dot(pt - center, normal)) == distal_side:
-                    candidates[i] = True
-            
-            # Keep only connected component containing tip
-            connected = self.find_connected_component(tip_id, candidates)
-            
-            for vid in connected:
-                regions[vid] = rid
-            
-            print(f"  {pv}: {len(connected)}")
-        
-        # =====================================================
-        # 2. Define MA region - ELLIPSE bounded by 4 points
-        # =====================================================
-        print("\n2. MA region (ellipse defined by 4 points)...")
-        
-        # Get the 4 MA points
         ma_p1 = self.markers['MA_point1']['coords']
         ma_p2 = self.markers['MA_point2']['coords']
         ma_p3 = self.markers['MA_point3']['coords']
         ma_p4 = self.markers['MA_point4']['coords']
         
         # All 4 points define the plane
-        # Use first 3 points to compute plane normal
         v1 = ma_p2 - ma_p1
         v2 = ma_p3 - ma_p1
         ma_plane_norm = np.cross(v1, v2)
         if np.linalg.norm(ma_plane_norm) < 1e-6:
-            # Use alternative vectors if first 3 are collinear
             v2 = ma_p4 - ma_p1
             ma_plane_norm = np.cross(v1, v2)
         
         if np.linalg.norm(ma_plane_norm) < 1e-6:
-            # Points are collinear, use default
             ma_plane_norm = np.array([0, 0, 1])
         else:
             ma_plane_norm = ma_plane_norm / np.linalg.norm(ma_plane_norm)
         
-        # Compute intersection of diagonals MA1-MA2 and MA3-MA4 (ellipse center)
-        # Line 1: P = ma_p1 + t * (ma_p2 - ma_p1)
-        # Line 2: Q = ma_p3 + s * (ma_p4 - ma_p3)
+        # Compute ellipse center
         d1 = ma_p2 - ma_p1
         d2 = ma_p4 - ma_p3
-        
-        # Solve: ma_p1 + t*d1 = ma_p3 + s*d2 using least squares
         A = np.column_stack([d1, -d2])
         b = ma_p3 - ma_p1
         try:
@@ -942,15 +1207,12 @@ class LASegmenter:
         except:
             ellipse_center = (ma_p1 + ma_p2 + ma_p3 + ma_p4) / 4.0
         
-        # Diagonal directions (axes of the ellipse)
-        diag1 = ma_p2 - ma_p1  # MA1-MA2 diagonal
-        diag2 = ma_p4 - ma_p3  # MA3-MA4 diagonal
-        
-        # Project diagonals onto the plane
+        # Project diagonals onto plane and compute axes
+        diag1 = ma_p2 - ma_p1
+        diag2 = ma_p4 - ma_p3
         diag1_in_plane = diag1 - np.dot(diag1, ma_plane_norm) * ma_plane_norm
         diag2_in_plane = diag2 - np.dot(diag2, ma_plane_norm) * ma_plane_norm
         
-        # Normalize to get unit vectors
         if np.linalg.norm(diag1_in_plane) > 1e-6:
             axis1 = diag1_in_plane / np.linalg.norm(diag1_in_plane)
         else:
@@ -961,345 +1223,222 @@ class LASegmenter:
         else:
             axis2 = d2 / np.linalg.norm(d2) if np.linalg.norm(d2) > 1e-6 else np.array([0, 1, 0])
         
-        # Semi-axes lengths (half the diagonal lengths)
+        # Semi-axes lengths
         semi_axis1 = np.linalg.norm(ma_p2 - ellipse_center)
         semi_axis2 = np.linalg.norm(ma_p4 - ellipse_center)
         
-        # Tolerance for perpendicular distance from plane
-        perp_tolerance = 10.0  # Allow 10mm perpendicular to the plane
-        
+        # Assign MA region
+        perp_tolerance = 10.0
         for i, pt in enumerate(self.points):
             if regions[i] != 0:
                 continue
-            
             v = pt - ellipse_center
-            
-            # Get perpendicular distance from MA plane
             perp_dist = abs(np.dot(v, ma_plane_norm))
-            
-            # Project point onto MA plane
             v_in_plane = v - np.dot(v, ma_plane_norm) * ma_plane_norm
-            
-            # Measure components along the two diagonal directions
             comp1 = np.dot(v_in_plane, axis1)
             comp2 = np.dot(v_in_plane, axis2)
             
-            # Ellipse equation: (comp1/semi_axis1)^2 + (comp2/semi_axis2)^2 <= 1
             if semi_axis1 > 1e-6 and semi_axis2 > 1e-6:
                 ellipse_param = (comp1 / semi_axis1) ** 2 + (comp2 / semi_axis2) ** 2
-                
-                # Include points within ellipse if perp_dist < 10mm
-                # OR points up to ~5mm outside ellipse if perp_dist < 5mm
                 if ellipse_param <= 1.0 and perp_dist <= perp_tolerance:
                     regions[i] = 5
                 elif ellipse_param <= 1.1 and perp_dist <= 5.0:
-                    # Allow points slightly outside ellipse (within ~5mm) if closer to plane
                     regions[i] = 5
         
         print(f"  MA: {np.sum(regions == 5)}")
+        return ellipse_center
+    
+    def create_pv_regions(self, regions, pv_name):
+        """Create PV region and ostium ring for a single PV."""
+        pv_rid_map = {'RSPV': 1, 'LSPV': 2, 'RIPV': 3, 'LIPV': 4, 'LAA': 6}
+        ost_rid_map = {'RSPV': 13, 'LSPV': 14, 'RIPV': 15, 'LIPV': 16}
         
-        # =====================================================
-        # 3. Define ostia rings (5mm from PV border) - FIXED to be proper rings
-        # =====================================================
-        print("\n3. Ostia rings (5mm from PV border)...")
-        ostium_ring_width = 5.0
+        pv_rid = pv_rid_map[pv_name]
         
-        # Store ostia centers and most anterior points for later use
-        ostia_centers = {}
-        ostia_anterior_pts = {}
+        # Create PV region
+        ost = self.markers[f'{pv_name}_ostium']
+        center, normal, radius = ost['coords'], ost['normal'], ost['radius']
+        tip_id = self.markers[f'{pv_name}_distal']['point_id']
+        distal_pt = self.points[tip_id]
+        distal_side = np.sign(np.dot(distal_pt - center, normal))
         
-        for pv, pv_rid, ost_rid in [('RSPV', 1, 13), ('LSPV', 2, 14), ('RIPV', 3, 15), ('LIPV', 4, 16)]:
+        candidates = np.zeros(len(self.points), dtype=bool)
+        for i, pt in enumerate(self.points):
+            if np.sign(np.dot(pt - center, normal)) == distal_side:
+                candidates[i] = True
+        
+        connected = self.find_connected_component(tip_id, candidates)
+        for vid in connected:
+            regions[vid] = pv_rid
+        
+        print(f"  {pv_name}: {len(connected)}")
+        
+        # Create ostium ring (if not LAA)
+        if pv_name != 'LAA':
+            ost_rid = ost_rid_map[pv_name]
             border_verts = self.get_pv_border_vertices(regions, pv_rid)
             
-            if len(border_verts) == 0:
-                print(f"  {pv}_Ostium: 0 (no border)")
-                ostia_centers[pv] = self.markers[f'{pv}_ostium']['coords']
-                ostia_anterior_pts[pv] = self.markers[f'{pv}_ostium']['coords']
-                continue
-            
-            # Compute center of border vertices
-            border_positions = np.array([self.points[v] for v in border_verts])
-            ostia_centers[pv] = np.mean(border_positions, axis=0)
-            
-            # Compute geodesic distance from border
-            dist_from_border = self.compute_geodesic_distance_from_set(border_verts)
-            
-            # For ostia_anterior_pts, use a default (will be computed from AP axis later)
-            most_anterior_pt = ostia_centers[pv]
-            ostia_anterior_pts[pv] = most_anterior_pt
-            
-            # Assign ostium ring - ONLY vertices within 5mm of border AND adjacent to PV or other ostium vertices
-            # This prevents "outpouching" by requiring connectivity
-            candidate_ostium = set()
-            for i in range(len(self.points)):
-                if regions[i] != 0:
-                    continue
-                if dist_from_border[i] <= ostium_ring_width:
-                    candidate_ostium.add(i)
-            
-            # Keep only the connected component that touches the PV border
-            if candidate_ostium:
-                # Build adjacency within candidates
-                adjacency = {v: set() for v in candidate_ostium}
-                for v in candidate_ostium:
-                    for neighbor in self.graph.neighbors(v):
-                        if neighbor in candidate_ostium:
-                            adjacency[v].add(neighbor)
-                        elif neighbor in border_verts:
-                            # Mark this candidate as touching the border
-                            adjacency[v].add(-1)  # Special marker
+            if len(border_verts) > 0:
+                dist_from_border = self.compute_geodesic_distance_from_set(border_verts)
+                candidate_ostium = set()
+                for i in range(len(self.points)):
+                    if regions[i] != 0:
+                        continue
+                    if dist_from_border[i] <= 5.0:
+                        candidate_ostium.add(i)
                 
-                # BFS from any vertex touching the border
-                start_verts = [v for v in candidate_ostium if -1 in adjacency[v]]
-                if start_verts:
-                    visited = set()
-                    queue = deque(start_verts)
-                    while queue:
-                        v = queue.popleft()
-                        if v in visited or v == -1:
-                            continue
-                        visited.add(v)
-                        for neighbor in adjacency[v]:
-                            if neighbor not in visited and neighbor != -1:
-                                queue.append(neighbor)
+                if candidate_ostium:
+                    adjacency = {v: set() for v in candidate_ostium}
+                    for v in candidate_ostium:
+                        for neighbor in self.graph.neighbors(v):
+                            if neighbor in candidate_ostium:
+                                adjacency[v].add(neighbor)
+                            elif neighbor in border_verts:
+                                adjacency[v].add(-1)
                     
-                    # Assign only connected vertices
-                    for v in visited:
-                        regions[v] = ost_rid
-                    
-                    print(f"  {pv}_Ostium: {len(visited)}")
-                else:
-                    print(f"  {pv}_Ostium: 0 (no connection to PV)")
+                    start_verts = [v for v in candidate_ostium if -1 in adjacency[v]]
+                    if start_verts:
+                        visited = set()
+                        queue = deque(start_verts)
+                        while queue:
+                            v = queue.popleft()
+                            if v in visited or v == -1:
+                                continue
+                            visited.add(v)
+                            for neighbor in adjacency[v]:
+                                if neighbor not in visited and neighbor != -1:
+                                    queue.append(neighbor)
+                        
+                        for v in visited:
+                            regions[v] = ost_rid
+                        
+                        print(f"  {pv_name}_Ostium: {len(visited)}")
+    
+    def create_laa_and_walls(self, regions, ellipse_center):
+        """Create wall regions (LAA already created during landmark selection)."""
+        # Create wall regions
+        print("\n2. Creating wall regions...")
+        
+        # Get ostia centers
+        ostia_centers = {}
+        for pv in ['RSPV', 'LSPV', 'RIPV', 'LIPV']:
+            pv_rid = {'RSPV': 1, 'LSPV': 2, 'RIPV': 3, 'LIPV': 4}[pv]
+            border_verts = self.get_pv_border_vertices(regions, pv_rid)
+            if len(border_verts) > 0:
+                border_positions = np.array([self.points[v] for v in border_verts])
+                ostia_centers[pv] = np.mean(border_positions, axis=0)
             else:
-                print(f"  {pv}_Ostium: 0 (no candidates)")
+                ostia_centers[pv] = self.markers[f'{pv}_ostium']['coords']
         
-        self.review_segmentation(regions)
-
-        # =====================================================
-        # 4. Define wall regions using straight lines
-        # =====================================================
-        print("\n4. Wall regions...")
-        
-        # Key points for boundaries
+        # Compute coordinate system
         rspv_ost_center = ostia_centers['RSPV']
         lspv_ost_center = ostia_centers['LSPV']
         ripv_ost_center = ostia_centers['RIPV']
         lipv_ost_center = ostia_centers['LIPV']
         
-        # Most anterior points of superior PV ostia (for roof anterior border)
-        rspv_anterior = ostia_anterior_pts['RSPV']
-        lspv_anterior = ostia_anterior_pts['LSPV']
-        
-        # Compute coordinate system
         pv_center = (rspv_ost_center + lspv_ost_center + ripv_ost_center + lipv_ost_center) / 4.0
-        
-        # Superior-Inferior axis (from inf PVs to sup PVs)
         sup_center = (rspv_ost_center + lspv_ost_center) / 2.0
         inf_center = (ripv_ost_center + lipv_ost_center) / 2.0
         si_axis = sup_center - inf_center
         si_axis = si_axis / np.linalg.norm(si_axis)
         
-        # Left-Right axis (from Left PVs to Right PVs)
         left_pv_center = (lspv_ost_center + lipv_ost_center) / 2.0
         right_pv_center = (rspv_ost_center + ripv_ost_center) / 2.0
         lr_axis = right_pv_center - left_pv_center
         lr_axis = lr_axis / np.linalg.norm(lr_axis)
         
-        # Anterior-Posterior axis (perpendicular to SI/LR plane)
         ap_axis = np.cross(lr_axis, si_axis)
         ap_axis = ap_axis / np.linalg.norm(ap_axis)
         
-        # Heart's center: midpoint between pv_center and ellipse_center along AP axis
-        # Project both centers onto AP axis, then find midpoint
         pv_ap_component = np.dot(pv_center, ap_axis)
         ellipse_ap_component = np.dot(ellipse_center, ap_axis)
         heart_center_ap = (pv_ap_component + ellipse_ap_component) / 2.0
-        
-        # Construct heart center: average of pv_center and ellipse_center, then project to AP axis
-        heart_center = (pv_center + ellipse_center) / 2.0
         heart_center = pv_center + (heart_center_ap - pv_ap_component) * ap_axis
         
-        # ===================
-        # BOUNDARY PLANES
-        # ===================
-        
-        # POSTERIOR WALL: Quadrangle defined by 4 planes
-        # Each plane is defined by 3 points forming the posterior wall boundary
-        # Use the center of 4 PV ostia as reference for normal orientation
+        # Define posterior wall planes
         pv_quadrangle_center = (rspv_ost_center + lspv_ost_center + ripv_ost_center + lipv_ost_center) / 4.0
         
-        # Top border: plane defined by RSPV center, LSPV center, and heart center
-        p1_top = rspv_ost_center
-        p2_top = lspv_ost_center
-        p3_top = heart_center
-        v1_top = p2_top - p1_top
-        v2_top = p3_top - p1_top
-        post_top_plane_normal = np.cross(v1_top, v2_top)
-        post_top_plane_normal = post_top_plane_normal / (np.linalg.norm(post_top_plane_normal) + 1e-10)
-        # Ensure normal points toward PV quadrangle center
-        to_center = pv_quadrangle_center - p1_top
-        if np.dot(post_top_plane_normal, to_center) < 0:
-            post_top_plane_normal = -post_top_plane_normal
-        post_top_plane_pt = p1_top
+        def make_plane(p1, p2, p3):
+            v1 = p2 - p1
+            v2 = p3 - p1
+            normal = np.cross(v1, v2)
+            normal = normal / (np.linalg.norm(normal) + 1e-10)
+            to_center = pv_quadrangle_center - p1
+            if np.dot(normal, to_center) < 0:
+                normal = -normal
+            return p1, normal
         
-        # Bottom border: plane defined by RIPV center, LIPV center, and heart center
-        p1_bottom = ripv_ost_center
-        p2_bottom = lipv_ost_center
-        p3_bottom = heart_center
-        v1_bottom = p2_bottom - p1_bottom
-        v2_bottom = p3_bottom - p1_bottom
-        post_bottom_plane_normal = np.cross(v1_bottom, v2_bottom)
-        post_bottom_plane_normal = post_bottom_plane_normal / (np.linalg.norm(post_bottom_plane_normal) + 1e-10)
-        # Ensure normal points toward PV quadrangle center
-        to_center = pv_quadrangle_center - p1_bottom
-        if np.dot(post_bottom_plane_normal, to_center) < 0:
-            post_bottom_plane_normal = -post_bottom_plane_normal
-        post_bottom_plane_pt = p1_bottom
+        post_top_plane_pt, post_top_plane_normal = make_plane(rspv_ost_center, lspv_ost_center, heart_center)
+        post_bottom_plane_pt, post_bottom_plane_normal = make_plane(ripv_ost_center, lipv_ost_center, heart_center)
+        post_left_plane_pt, post_left_plane_normal = make_plane(lspv_ost_center, lipv_ost_center, heart_center)
+        post_right_plane_pt, post_right_plane_normal = make_plane(rspv_ost_center, ripv_ost_center, heart_center)
         
-        # Left border: plane defined by LSPV center, LIPV center, and heart center
-        p1_left = lspv_ost_center
-        p2_left = lipv_ost_center
-        p3_left = heart_center
-        v1_left = p2_left - p1_left
-        v2_left = p3_left - p1_left
-        post_left_plane_normal = np.cross(v1_left, v2_left)
-        post_left_plane_normal = post_left_plane_normal / (np.linalg.norm(post_left_plane_normal) + 1e-10)
-        # Ensure normal points toward PV quadrangle center
-        to_center = pv_quadrangle_center - p1_left
-        if np.dot(post_left_plane_normal, to_center) < 0:
-            post_left_plane_normal = -post_left_plane_normal
-        post_left_plane_pt = p1_left
-        
-        # Right border: plane defined by RSPV center, RIPV center, and heart center
-        p1_right = rspv_ost_center
-        p2_right = ripv_ost_center
-        p3_right = heart_center
-        v1_right = p2_right - p1_right
-        v2_right = p3_right - p1_right
-        post_right_plane_normal = np.cross(v1_right, v2_right)
-        post_right_plane_normal = post_right_plane_normal / (np.linalg.norm(post_right_plane_normal) + 1e-10)
-        # Ensure normal points toward PV quadrangle center
-        to_center = pv_quadrangle_center - p1_right
-        if np.dot(post_right_plane_normal, to_center) < 0:
-            post_right_plane_normal = -post_right_plane_normal
-        post_right_plane_pt = p1_right
-        
-        # ROOF anterior border: Plane defined by foremost vertices of RSPV and LSPV ostium rings and heart center
-        rspv_ostium = np.where(regions == 13)[0]  # RSPV ostium ring
-        lspv_ostium = np.where(regions == 14)[0]  # LSPV ostium ring
-        
+        # Roof anterior plane
+        rspv_ostium = np.where(regions == 13)[0]
+        lspv_ostium = np.where(regions == 14)[0]
         rspv_anterior_vid = None
         lspv_anterior_vid = None
         
         if len(rspv_ostium) > 0:
-            # Find ostium vertex with minimum component along AP axis (most anterior)
             ap_scores = np.dot(self.points[rspv_ostium] - ostia_centers['RSPV'], ap_axis)
-            min_idx = np.argmin(ap_scores)
-            rspv_anterior_vid = rspv_ostium[min_idx]
+            rspv_anterior_vid = rspv_ostium[np.argmin(ap_scores)]
         
         if len(lspv_ostium) > 0:
-            # Find ostium vertex with minimum component along AP axis (most anterior)
             ap_scores = np.dot(self.points[lspv_ostium] - ostia_centers['LSPV'], ap_axis)
-            min_idx = np.argmin(ap_scores)
-            lspv_anterior_vid = lspv_ostium[min_idx]
+            lspv_anterior_vid = lspv_ostium[np.argmin(ap_scores)]
         
-        # Create plane from foremost vertices and heart center
         roof_ant_plane_pt = None
         roof_ant_plane_normal = None
-        
         if rspv_anterior_vid is not None and lspv_anterior_vid is not None:
-            p1_roof_ant = self.points[rspv_anterior_vid]
-            p2_roof_ant = self.points[lspv_anterior_vid]
-            p3_roof_ant = heart_center
-            
-            v1_roof_ant = p2_roof_ant - p1_roof_ant
-            v2_roof_ant = p3_roof_ant - p1_roof_ant
-            roof_ant_plane_normal = np.cross(v1_roof_ant, v2_roof_ant)
-            roof_ant_plane_normal = roof_ant_plane_normal / (np.linalg.norm(roof_ant_plane_normal) + 1e-10)
-            
-            # Ensure normal points toward anterior (away from posterior wall)
-            # Use pv_quadrangle_center as reference - normal should point away from it
-            to_pv_center = pv_quadrangle_center - p1_roof_ant
-            if np.dot(roof_ant_plane_normal, to_pv_center) > 0:
+            p1 = self.points[rspv_anterior_vid]
+            p2 = self.points[lspv_anterior_vid]
+            roof_ant_plane_pt, roof_ant_plane_normal = make_plane(p1, p2, heart_center)
+            # Flip to point anterior
+            to_pv = pv_quadrangle_center - p1
+            if np.dot(roof_ant_plane_normal, to_pv) > 0:
                 roof_ant_plane_normal = -roof_ant_plane_normal
-            
-            roof_ant_plane_pt = p1_roof_ant
-
-        # INFERIOR: Same width as posterior, between posterior bottom and MA
-        # Right border: vertical plane through RIPV center (same as posterior right extended)
-        # Left border: vertical plane through LIPV center (same as posterior left extended)
         
-        # ANTERIOR: Between roof anterior border and MA
-        # Right border: line from RSPV ostia center to MA
-        # Left border: line from LSPV ostia center to MA (or LAA to MA)
-        
-        # For anterior borders, we use the same right/left borders as roof
-        # Plane through RSPV center, perpendicular to LR axis
-        ant_right_plane_pt = rspv_ost_center
-        ant_right_plane_normal = lr_axis
-        
-        # Plane through LSPV center, perpendicular to LR axis
-        ant_left_plane_pt = lspv_ost_center
-        ant_left_plane_normal = lr_axis
-        
-        # Anterior boundary plane: through heart center, perpendicular to AP axis
-        # Prevents posterior wall from extending forward beyond this plane
-        ostia_anterior_plane_pt = heart_center
-        ostia_anterior_plane_normal = ap_axis
-        
-        unassigned = regions == 0
-        
-        # Calculate signed distances for all points
+        # Calculate distances
         dist_post_top = self.signed_distance_to_plane(self.points, post_top_plane_pt, post_top_plane_normal)
         dist_post_bottom = self.signed_distance_to_plane(self.points, post_bottom_plane_pt, post_bottom_plane_normal)
         dist_post_right = self.signed_distance_to_plane(self.points, post_right_plane_pt, post_right_plane_normal)
         dist_post_left = self.signed_distance_to_plane(self.points, post_left_plane_pt, post_left_plane_normal)
         
-        # POSTERIOR WALL: Quadrangle bounded by 4 planes through PV centers and heart center
-        post_mask = (unassigned &
-                     (dist_post_top > 0) &      # On posterior side of top plane
-                     (dist_post_bottom > 0) &   # On posterior side of bottom plane
-                     (dist_post_right > 0) &    # On posterior side of right plane
-                     (dist_post_left > 0))      # On posterior side of left plane
+        unassigned = regions == 0
+        
+        # Posterior wall
+        post_mask = (unassigned & (dist_post_top > 0) & (dist_post_bottom > 0) & (dist_post_right > 0) & (dist_post_left > 0))
         regions[post_mask] = 7
         unassigned = regions == 0
         print(f"  Posterior: {np.sum(regions == 7)}")
-
-        # Calculate distances for anterior/roof boundaries
+        
+        # Roof anterior plane distances
+        dist_roof_ant = np.zeros(len(self.points))
+        if roof_ant_plane_pt is not None:
+            dist_roof_ant = self.signed_distance_to_plane(self.points, roof_ant_plane_pt, roof_ant_plane_normal)
+        
+        # Roof
+        ant_right_plane_pt = rspv_ost_center
+        ant_right_plane_normal = lr_axis
+        ant_left_plane_pt = lspv_ost_center
+        ant_left_plane_normal = lr_axis
+        
         dist_ant_right = self.signed_distance_to_plane(self.points, ant_right_plane_pt, ant_right_plane_normal)
         dist_ant_left = self.signed_distance_to_plane(self.points, ant_left_plane_pt, ant_left_plane_normal)
         
-        # Roof anterior boundary plane
-        dist_roof_ant = np.zeros(len(self.points))
-        if roof_ant_plane_pt is not None and roof_ant_plane_normal is not None:
-            dist_roof_ant = self.signed_distance_to_plane(self.points, roof_ant_plane_pt, roof_ant_plane_normal)
-        
-        # ROOF: Between sup PVs and roof anterior line, between RSPV-LSPV width
-        roof_mask = (unassigned &
-                     (dist_post_top < 0) &      # Anterior of sup PVs line (opposite side from posterior wall)
-                     (dist_roof_ant < 0) &      # Posterior of roof anterior plane (behind the foremost ostium vertices)
-                     (dist_ant_right < 0) &     # Left of RSPV (LR axis now points left->right)
-                     (dist_ant_left > 0))       # Right of LSPV (LR axis now points left->right)
+        roof_mask = (unassigned & (dist_post_top < 0) & (dist_roof_ant < 0) & (dist_ant_right < 0) & (dist_ant_left > 0))
         regions[roof_mask] = 8
         unassigned = regions == 0
         print(f"  Roof: {np.sum(regions == 8)}")
         
-        # INFERIOR: Below posterior (below inf PVs line), same width as posterior
-        inferior_mask = (unassigned &
-                         (dist_post_bottom < 0) &   # Anterior of bottom plane (not in posterior interior)
-                         (dist_post_right > 0) &    # Posterior side of right plane (same as posterior interior)
-                         (dist_post_left > 0))      # Posterior side of left plane (same as posterior interior)
+        # Inferior
+        inferior_mask = (unassigned & (dist_post_bottom < 0) & (dist_post_right > 0) & (dist_post_left > 0))
         regions[inferior_mask] = 9
         unassigned = regions == 0
         print(f"  Inferior: {np.sum(regions == 9)}")
-
-        # ANTERIOR WALL: Defined by 3 planes
-        # Plane 1: RSPV foremost vertex, MA center, heart center (right boundary)
-        # Plane 2: LSPV foremost vertex, MA center, heart center (left boundary)
-        # Plane 3: RSPV foremost vertex, LSPV foremost vertex, heart center (posterior boundary)
         
-        ma_center = ellipse_center  # MA center from ellipse (mitral annulus)
-        
+        # Anterior wall
+        ma_center = ellipse_center
         ant_plane_right_pt = None
         ant_plane_right_normal = None
         ant_plane_left_pt = None
@@ -1309,111 +1448,156 @@ class LASegmenter:
             rspv_ant_pt = self.points[rspv_anterior_vid]
             lspv_ant_pt = self.points[lspv_anterior_vid]
             
-            # Right boundary plane: RSPV foremost, MA center, heart center
-            p1_ant_r = rspv_ant_pt
-            p2_ant_r = ma_center
-            p3_ant_r = heart_center
-            v1_ant_r = p2_ant_r - p1_ant_r
-            v2_ant_r = p3_ant_r - p1_ant_r
-            ant_plane_right_normal = np.cross(v1_ant_r, v2_ant_r)
-            ant_plane_right_normal = ant_plane_right_normal / (np.linalg.norm(ant_plane_right_normal) + 1e-10)
-            
-            # Ensure normal points away from pv_quadrangle_center (toward anterior/lateral)
-            to_pv_center = pv_quadrangle_center - p1_ant_r
-            if np.dot(ant_plane_right_normal, to_pv_center) > 0:
+            ant_plane_right_pt, ant_plane_right_normal = make_plane(rspv_ant_pt, ma_center, heart_center)
+            to_pv = pv_quadrangle_center - rspv_ant_pt
+            if np.dot(ant_plane_right_normal, to_pv) > 0:
                 ant_plane_right_normal = -ant_plane_right_normal
-            ant_plane_right_pt = p1_ant_r
             
-            # Left boundary plane: LSPV foremost, MA center, heart center
-            p1_ant_l = lspv_ant_pt
-            p2_ant_l = ma_center
-            p3_ant_l = heart_center
-            v1_ant_l = p2_ant_l - p1_ant_l
-            v2_ant_l = p3_ant_l - p1_ant_l
-            ant_plane_left_normal = np.cross(v1_ant_l, v2_ant_l)
-            ant_plane_left_normal = ant_plane_left_normal / (np.linalg.norm(ant_plane_left_normal) + 1e-10)
-            
-            # Ensure normal points away from pv_quadrangle_center (toward anterior/lateral)
-            to_pv_center = pv_quadrangle_center - p1_ant_l
-            if np.dot(ant_plane_left_normal, to_pv_center) > 0:
+            ant_plane_left_pt, ant_plane_left_normal = make_plane(lspv_ant_pt, ma_center, heart_center)
+            to_pv = pv_quadrangle_center - lspv_ant_pt
+            if np.dot(ant_plane_left_normal, to_pv) > 0:
                 ant_plane_left_normal = -ant_plane_left_normal
-            ant_plane_left_pt = p1_ant_l
         
-        # Calculate distances for anterior region
         dist_ant_right = np.zeros(len(self.points))
         dist_ant_left = np.zeros(len(self.points))
-        
-        if ant_plane_right_pt is not None and ant_plane_right_normal is not None:
+        if ant_plane_right_pt is not None:
             dist_ant_right = self.signed_distance_to_plane(self.points, ant_plane_right_pt, ant_plane_right_normal)
-        
-        if ant_plane_left_pt is not None and ant_plane_left_normal is not None:
+        if ant_plane_left_pt is not None:
             dist_ant_left = self.signed_distance_to_plane(self.points, ant_plane_left_pt, ant_plane_left_normal)
         
-        # ANTERIOR: Region in front of foremost ostia, bounded by RSPV/LAA plane and LSPV/LAA plane
-        anterior_mask = (unassigned &
-                         (dist_roof_ant > 0) &      # Anterior of roof anterior plane (foremost ostia vertices)
-                         (dist_ant_right < 0) &     # Anterior side of RSPV/MA plane
-                         (dist_ant_left > 0))       # Anterior side of LSPV/MA plane
+        anterior_mask = (unassigned & (dist_roof_ant > 0) & (dist_ant_right < 0) & (dist_ant_left > 0))
         regions[anterior_mask] = 12
         unassigned = regions == 0
         print(f"  Anterior: {np.sum(regions == 12)}")
-
-        # SEPTAL: Right side (right of RSPV/RIPV line)
-        septal_mask = (unassigned &
-                       (dist_post_right < 0))       # Right of right PVs
+        
+        # Septal
+        septal_mask = (unassigned & (dist_post_right < 0))
         regions[septal_mask] = 11
         unassigned = regions == 0
         print(f"  Septal: {np.sum(regions == 11)}")
         
-        # Define LAA boundary for lateral region
+        # Lateral
         laa_center = self.markers['LAA_ostium']['coords']
         dist_laa_boundary = self.signed_distance_to_plane(self.points, laa_center, lr_axis)
-
-        # LATERAL: Between LAA and left PVs (LSPV/LIPV), down to MA
-        # Right boundary: LAA center
-        # Left boundary: left PV line (LSPV/LIPV)
-        lateral_mask = (unassigned &
-                        (dist_laa_boundary > 0) &   # Left of LAA
-                        (dist_post_left < 0))       # Right of left PVs (still within the left side)
-        # If nothing matches that narrow band, just take what's left of LAA
+        
+        lateral_mask = (unassigned & (dist_laa_boundary > 0) & (dist_post_left < 0))
         if np.sum(lateral_mask) == 0:
             lateral_mask = (unassigned & (dist_laa_boundary > 0))
         regions[lateral_mask] = 10
         unassigned = regions == 0
         print(f"  Lateral: {np.sum(regions == 10)}")
-
-        self.review_segmentation(regions)
-
-        # Assign any remaining vertices
-        remaining = np.sum(unassigned)
-        if remaining > 0:
-            print(f"\n  Assigning {remaining} remaining vertices...")
-            assigned = np.where(regions > 0)[0]
-            for idx in np.where(unassigned)[0]:
-                dists = np.linalg.norm(self.points[assigned] - self.points[idx], axis=1)
-                regions[idx] = regions[assigned[np.argmin(dists)]]
-
+    
+    def review_segmentation(self, regions, title="SEGMENTATION REVIEW", step=None):
+        """Review segmentation with navigation controls. Returns 'next' to proceed, 'undo' to go back."""
+        print("\n" + "="*60)
+        print(f"  {title}")
+        print("="*60)
         
-        # Smooth and enforce continuity
-        self.smooth_boundaries(regions, iterations=3)
-        self.enforce_continuity(regions)
-        self.smooth_boundaries(regions, iterations=2)
-        self.enforce_continuity(regions)
+        is_final_review = (step == 'FINAL')
+        is_veins_review = (step == 'VEINS')
+        is_walls_review = (step == 'WALLS')
         
-        # Verify
-        print("\n  Verifying continuity...")
-        all_ok = True
-        for rid in range(1, 17):
-            count = np.sum(regions == rid)
-            if count > 0:
-                components = self.find_connected_components_for_region(regions, rid)
-                if len(components) > 1:
-                    print(f"    WARNING: {self.extended_region_names[rid]} has {len(components)} components")
-                    all_ok = False
-        if all_ok:
-            print("    ✓ All regions continuous")
+        if is_final_review:
+            help_text = "SPACE=save, ESC=discard"
+            print(f"\n{help_text}")
+        elif is_veins_review:
+            help_text = "SPACE=continue, 's'=checkpoint"
+            print(f"\n{help_text}\n")
+        elif is_walls_review:
+            help_text = "SPACE=continue, ESC=redo walls"
+            print(f"\n{help_text}\n")
+        else:
+            help_text = "SPACE=continue, ESC=undo"
+            print(f"\n{help_text}\n")
         
-        return regions
+        # Setup VTK viewing
+        renderer = vtk.vtkRenderer()
+        renderer.SetBackground(0.1, 0.1, 0.1)
+        
+        window = vtk.vtkRenderWindow()
+        window.AddRenderer(renderer)
+        window.SetSize(1000, 1000)
+        
+        interactor = vtk.vtkRenderWindowInteractor()
+        interactor.SetRenderWindow(window)
+        interactor.SetInteractorStyle(vtk.vtkInteractorStyleTrackballCamera())
+        
+        # Create colored mesh based on regions
+        region_colors = vtk.vtkUnsignedCharArray()
+        region_colors.SetNumberOfComponents(3)
+        region_colors.SetName("Colors")
+        
+        for vid in range(len(self.points)):
+            rid = int(regions[vid])
+            c = self.extended_color_map.get(rid, (200, 200, 200))
+            region_colors.InsertNextTuple3(*c)
+        
+        self.mesh.GetPointData().SetScalars(region_colors)
+        
+        # Add mesh visualization
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputData(self.mesh)
+        mapper.SetScalarModeToUsePointData()
+        
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        renderer.AddActor(actor)
+        
+        # Add text display for title and keybindings
+        text_actor = vtk.vtkTextActor()
+        text_actor.GetTextProperty().SetFontSize(14)
+        text_actor.GetTextProperty().SetColor(1, 1, 0)
+        text_actor.SetPosition(10, 10)
+        text_actor.SetInput(f"{title}\n\n{help_text}")
+        renderer.AddViewProp(text_actor)
+        
+        # Status text for messages like checkpoint saved
+        status_text = vtk.vtkTextActor()
+        status_text.GetTextProperty().SetFontSize(12)
+        status_text.GetTextProperty().SetColor(0, 1, 0)
+        status_text.SetPosition(10, window.GetSize()[1] - 50)
+        status_text.SetInput("")
+        renderer.AddViewProp(status_text)
+        
+        # State for key handling
+        state = {'action': None}
+        
+        def on_key(obj, event):
+            key = interactor.GetKeySym()
+            if key == 'space':
+                state['action'] = 'next'
+                window.Finalize()
+                interactor.TerminateApp()
+            elif key == 'Escape':
+                # ESC is blocked during veins review
+                if is_veins_review:
+                    return
+                # ESC behavior depends on review type
+                if is_final_review:
+                    state['action'] = 'discard'
+                else:
+                    state['action'] = 'undo'
+                window.Finalize()
+                interactor.TerminateApp()
+            elif is_final_review and key == 'q':
+                state['action'] = 'quit'
+                window.Finalize()
+                interactor.TerminateApp()
+            elif is_veins_review and key == 's':
+                # Save checkpoint
+                base_path = self.vtk_file.replace('.vtk', '')
+                self.save_checkpoint(base_path)
+                status_text.SetInput("✓ Checkpoint saved")
+                window.Render()
+        
+        interactor.AddObserver('KeyPressEvent', on_key)
+        
+        window.SetWindowName(title)
+        interactor.Initialize()
+        window.Render()
+        interactor.Start()
+        
+        return state['action'] if state['action'] is not None else 'next'
     
     def create_boundary_actor(self, regions):
         edges = set()
@@ -1532,277 +1716,6 @@ class LASegmenter:
             print(f"✗ Failed to load checkpoint: {e}")
             return None
     
-    def review_segmentation(self, regions):
-        """Simple review without editing"""
-        print("\n" + "="*60)
-        print("  REVIEW SEGMENTATION")
-        print("="*60)
-        print("\n'a'=all, 0-9=region, 'n'=next, 'Left/Right'=prev/next, 'b'=boundaries")
-        print("'p'=posterior planes, 'o'=anterior planes, 'c'=coord system, 's'=save, 'q'=quit\n")
-        
-        colors_arr = np.array([self.extended_color_map.get(int(r), (200,200,200)) for r in regions], dtype=np.uint8)
-        
-        vtk_colors = vtk.vtkUnsignedCharArray()
-        vtk_colors.SetNumberOfComponents(3)
-        vtk_colors.SetName("Colors")
-        for c in colors_arr:
-            vtk_colors.InsertNextTuple3(*c)
-        
-        mesh = vtk.vtkPolyData()
-        mesh.DeepCopy(self.mesh)
-        mesh.GetPointData().SetScalars(vtk_colors)
-        
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputData(mesh)
-        mesh_actor = vtk.vtkActor()
-        mesh_actor.SetMapper(mapper)
-        mesh_actor.GetProperty().SetRepresentationToSurface()
-        mesh_actor.GetProperty().LightingOn()
-        
-        renderer = vtk.vtkRenderer()
-        renderer.AddActor(mesh_actor)
-        renderer.SetBackground(0.1, 0.1, 0.2)
-        
-        window = vtk.vtkRenderWindow()
-        window.AddRenderer(renderer)
-        window.SetSize(1200, 900)
-        
-        interactor = vtk.vtkRenderWindowInteractor()
-        interactor.SetRenderWindow(window)
-        interactor.SetInteractorStyle(vtk.vtkInteractorStyleTrackballCamera())
-        
-        state = {'view': 'all', 'view_idx': 0, 'bounds': True, 'save': False, 'checkpoint': False, 'show_posterior_planes': False, 'show_anterior_planes': False, 'posterior_actors': [], 'anterior_actors': []}
-        
-        boundary = [self.create_boundary_actor(regions)]
-        if boundary[0]:
-            renderer.AddActor(boundary[0])
-        
-        text = vtk.vtkTextActor()
-        text.GetTextProperty().SetFontSize(18)
-        text.GetTextProperty().SetColor(1, 1, 0)
-        text.SetPosition(10, 10)
-        renderer.AddViewProp(text)
-        
-        def update_view(region=None):
-            ca = np.array([self.extended_color_map.get(int(r), (200,200,200)) for r in regions], dtype=np.uint8)
-            if region is None:
-                state['view'] = 'all'
-                for i, c in enumerate(ca):
-                    vtk_colors.SetTuple3(i, *c)
-                text.SetInput("VIEW: All | 's'=save | 'q'=quit")
-            else:
-                state['view'] = region
-                for i, c in enumerate(ca):
-                    if regions[i] == region:
-                        vtk_colors.SetTuple3(i, *c)
-                    else:
-                        vtk_colors.SetTuple3(i, 50, 50, 50)
-                name = self.extended_region_names[region] if region < len(self.extended_region_names) else f"R{region}"
-                text.SetInput(f"VIEW: {name} ({np.sum(regions == region)}) | 'a'=all")
-            mesh.GetPointData().Modified()
-            window.Render()
-        
-        def update_bounds():
-            if boundary[0]:
-                renderer.RemoveActor(boundary[0])
-                boundary[0] = None
-            if state['bounds']:
-                boundary[0] = self.create_boundary_actor(regions)
-                if boundary[0]:
-                    renderer.AddActor(boundary[0])
-            window.Render()
-        
-        def toggle_posterior_planes():
-            """Toggle visibility of posterior wall bounding planes"""
-            state['show_posterior_planes'] = not state['show_posterior_planes']
-            
-            # Remove existing actors if any
-            for actor in state['posterior_actors']:
-                renderer.RemoveActor(actor)
-            state['posterior_actors'] = []
-            
-            if state['show_posterior_planes']:
-                # Retrieve PV centers from markers
-                rspv_center = self.markers.get('RSPV_ostium', {}).get('coords')
-                lspv_center = self.markers.get('LSPV_ostium', {}).get('coords')
-                ripv_center = self.markers.get('RIPV_ostium', {}).get('coords')
-                lipv_center = self.markers.get('LIPV_ostium', {}).get('coords')
-                
-                if all([rspv_center is not None, lspv_center is not None, 
-                        ripv_center is not None, lipv_center is not None]):
-                    
-                    # Approximate heart_center and plane normals from segment data
-                    # For visualization, we'll recalculate them simply
-                    pv_center = (rspv_center + lspv_center + ripv_center + lipv_center) / 4.0
-                    
-                    # Top plane: RSPV, LSPV, pv_center
-                    v1 = lspv_center - rspv_center
-                    v2 = pv_center - rspv_center
-                    normal_top = np.cross(v1, v2)
-                    a_top, e_top = self.create_posterior_wall_plane_actors(
-                        rspv_center, lspv_center, pv_center, normal_top, (1, 0, 0))  # Red
-                    renderer.AddActor(a_top)
-                    renderer.AddActor(e_top)
-                    state['posterior_actors'].extend([a_top, e_top])
-                    
-                    # Bottom plane: RIPV, LIPV, pv_center
-                    v1 = lipv_center - ripv_center
-                    v2 = pv_center - ripv_center
-                    normal_bottom = np.cross(v2, v1)
-                    a_bot, e_bot = self.create_posterior_wall_plane_actors(
-                        ripv_center, lipv_center, pv_center, normal_bottom, (0, 1, 0))  # Green
-                    renderer.AddActor(a_bot)
-                    renderer.AddActor(e_bot)
-                    state['posterior_actors'].extend([a_bot, e_bot])
-                    
-                    # Left plane: LSPV, LIPV, pv_center
-                    v1 = lipv_center - lspv_center
-                    v2 = pv_center - lspv_center
-                    normal_left = np.cross(v2, v1)
-                    a_left, e_left = self.create_posterior_wall_plane_actors(
-                        lspv_center, lipv_center, pv_center, normal_left, (0, 0, 1))  # Blue
-                    renderer.AddActor(a_left)
-                    renderer.AddActor(e_left)
-                    state['posterior_actors'].extend([a_left, e_left])
-                    
-                    # Right plane: RSPV, RIPV, pv_center
-                    v1 = ripv_center - rspv_center
-                    v2 = pv_center - rspv_center
-                    normal_right = np.cross(v1, v2)
-                    a_right, e_right = self.create_posterior_wall_plane_actors(
-                        rspv_center, ripv_center, pv_center, normal_right, (1, 1, 0))  # Yellow
-                    renderer.AddActor(a_right)
-                    renderer.AddActor(e_right)
-                    state['posterior_actors'].extend([a_right, e_right])
-            
-            window.Render()
-        
-        def toggle_anterior_planes():
-            """Toggle visibility of anterior wall bounding planes"""
-            state['show_anterior_planes'] = not state['show_anterior_planes']
-            
-            # Remove existing actors if any
-            for actor in state['anterior_actors']:
-                renderer.RemoveActor(actor)
-            state['anterior_actors'] = []
-            
-            if state['show_anterior_planes']:
-                # Retrieve necessary data from segmentation
-                rspv_center = self.markers.get('RSPV_ostium', {}).get('coords')
-                lspv_center = self.markers.get('LSPV_ostium', {}).get('coords')
-                ma_center_vis = self.markers.get('MA_point1', {}).get('coords')
-                
-                if all([rspv_center is not None, lspv_center is not None, ma_center_vis is not None]):
-                    # Approximate heart_center for visualization
-                    ma_p1 = self.markers.get('MA_point1', {}).get('coords')
-                    ma_p2 = self.markers.get('MA_point2', {}).get('coords')
-                    if ma_p1 is not None and ma_p2 is not None:
-                        ma_center_vis = (ma_p1 + ma_p2) / 2.0
-                    else:
-                        ma_center_vis = ma_center_vis
-                    
-                    pv_center = (rspv_center + lspv_center) / 2.0
-                    heart_center_approx = (pv_center + ma_center_vis) / 2.0
-                    
-                    # Plane 1 (Right): RSPV foremost, MA center, heart center
-                    # For visualization, use approximated foremost RSPV
-                    p1_r = rspv_center  # Approximate foremost as ostium center
-                    p2_r = ma_center_vis
-                    p3_r = heart_center_approx
-                    v1_r = p2_r - p1_r
-                    v2_r = p3_r - p1_r
-                    normal_ant_right = np.cross(v1_r, v2_r)
-                    a_ant_r, e_ant_r = self.create_posterior_wall_plane_actors(
-                        p1_r, p2_r, p3_r, normal_ant_right, (1, 0, 1), plane_size=15)  # Magenta
-                    renderer.AddActor(a_ant_r)
-                    renderer.AddActor(e_ant_r)
-                    state['anterior_actors'].extend([a_ant_r, e_ant_r])
-                    
-                    # Plane 2 (Left): LSPV foremost, MA center, heart center
-                    p1_l = lspv_center  # Approximate foremost as ostium center
-                    p2_l = ma_center_vis
-                    p3_l = heart_center_approx
-                    v1_l = p2_l - p1_l
-                    v2_l = p3_l - p1_l
-                    normal_ant_left = np.cross(v1_l, v2_l)
-                    a_ant_l, e_ant_l = self.create_posterior_wall_plane_actors(
-                        p1_l, p2_l, p3_l, normal_ant_left, (0, 1, 1), plane_size=15)  # Cyan
-                    renderer.AddActor(a_ant_l)
-                    renderer.AddActor(e_ant_l)
-                    state['anterior_actors'].extend([a_ant_l, e_ant_l])
-                    
-                    # Plane 3 (Posterior boundary): RSPV foremost, LSPV foremost, heart center
-                    p1_post = rspv_center  # Approximate foremost as ostium center
-                    p2_post = lspv_center  # Approximate foremost as ostium center
-                    p3_post = heart_center_approx
-                    v1_post = p2_post - p1_post
-                    v2_post = p3_post - p1_post
-                    normal_ant_post = np.cross(v1_post, v2_post)
-                    a_ant_post, e_ant_post = self.create_posterior_wall_plane_actors(
-                        p1_post, p2_post, p3_post, normal_ant_post, (1, 1, 0), plane_size=15)  # Yellow
-                    renderer.AddActor(a_ant_post)
-                    renderer.AddActor(e_ant_post)
-                    state['anterior_actors'].extend([a_ant_post, e_ant_post])
-            
-            window.Render()
-        
-        def update_bounds():
-            if boundary[0]:
-                renderer.RemoveActor(boundary[0])
-                boundary[0] = None
-            if state['bounds']:
-                boundary[0] = self.create_boundary_actor(regions)
-                if boundary[0]:
-                    renderer.AddActor(boundary[0])
-            window.Render()
-        
-        def on_key(obj, event):
-            key = interactor.GetKeySym()
-            
-            if key == 's':
-                # Save checkpoint
-                base_path = os.path.splitext(self.vtk_file)[0]
-                if self.save_checkpoint(base_path):
-                    state['checkpoint'] = True
-                    text.SetInput("VIEW: All | Checkpoint saved! Press 'q' to quit or continue reviewing")
-                    text.GetTextProperty().SetColor(0, 1, 0)
-                    window.Render()
-            elif key == 'q':
-                state['save'] = False
-                window.Finalize()
-                interactor.TerminateApp()
-            elif key == 'b':
-                state['bounds'] = not state['bounds']
-                update_bounds()
-            elif key == 'p':
-                toggle_posterior_planes()
-            elif key == 'o':
-                toggle_anterior_planes()
-            elif key == 'a':
-                update_view(None)
-            elif key == 'n' or key == 'Right':
-                valid = sorted(set(regions))
-                state['view_idx'] = (state['view_idx'] + 1) % len(valid)
-                update_view(valid[state['view_idx']])
-            elif key == 'Left':
-                valid = sorted(set(regions))
-                state['view_idx'] = (state['view_idx'] - 1) % len(valid)
-                update_view(valid[state['view_idx']])
-            elif key.isdigit():
-                r = int(key)
-                if r in set(regions):
-                    update_view(r)
-        
-        interactor.AddObserver('KeyPressEvent', on_key)
-        
-        update_view(None)
-        window.SetWindowName("LA Segmenter - Review (s=save, q=quit)")
-        interactor.Initialize()
-        window.Render()
-        interactor.Start()
-        
-        return state['save']
-    
     def save_results(self, regions, prefix):
         print("\n" + "="*60)
         print("  SAVING")
@@ -1874,33 +1787,101 @@ class LASegmenter:
             self.faces = segmenter.faces
             self.graph = segmenter.graph
             self.markers = segmenter.markers
+            regions = np.zeros(len(self.points), dtype=int)
+            
+            # Recreate all regions from saved markers
+            print("\nRecreating regions from checkpoint...")
+            
+            # 1. Create MA region
+            self.create_ma_region(regions)
+            
+            # 2. Create PV regions (RSPV, LSPV, RIPV, LIPV, LAA)
+            for pv_name in ['RSPV', 'LSPV', 'RIPV', 'LIPV', 'LAA']:
+                if f'{pv_name}_ostium' in self.markers:
+                    self.create_pv_regions(regions, pv_name)
+            
         else:
-            # Normal flow: load mesh, select landmarks
+            # Normal flow: load mesh, select landmarks interactively
+            # (Reviews are now integrated into select_landmarks_interactive with review_mode)
             self.load_mesh()
             self.center_mesh()
             self.build_graph()
-            self.select_landmarks_interactive()
+            regions, last_pv = self.select_landmarks_interactive()
         
-        # Define regions (after checkpoint load or landmark selection)
-        regions = self.define_regions()
+        action = self.review_segmentation(regions, "VEIGNS FINAL REVIEW - for save", step='VEINS')
+
+        # Extract ellipse center from MA points for wall creation
+        ma_p1 = self.markers['MA_point1']['coords']
+        ma_p2 = self.markers['MA_point2']['coords']
+        ma_p3 = self.markers['MA_point3']['coords']
+        ma_p4 = self.markers['MA_point4']['coords']
         
+        d1 = ma_p2 - ma_p1
+        d2 = ma_p4 - ma_p3
+        A = np.column_stack([d1, -d2])
+        b = ma_p3 - ma_p1
+        try:
+            params, _ = np.linalg.lstsq(A, b, rcond=None)
+            t = params[0]
+            ellipse_center = ma_p1 + t * d1
+        except:
+            ellipse_center = (ma_p1 + ma_p2 + ma_p3 + ma_p4) / 4.0
+        
+        # Create walls with undo support
+        while True:
+            print("\n" + "="*60)
+            print("  CREATE WALL REGIONS")
+            print("="*60)
+            self.create_laa_and_walls(regions, ellipse_center)
+            
+            action = self.review_segmentation(regions, "WALLS REVIEW BEFORE OPTIMIZATION", step='WALLS')
+            if action == 'undo':
+                # Delete all wall regions (7-12)
+                for rid in range(7, 13):
+                    regions[regions == rid] = 0
+                print("⚠ Wall regions deleted. Creating walls again...\n")
+                continue
+            break
+
+        # Assign remaining vertices to nearest region
+        # unassigned = regions == 0
+        # remaining = np.sum(unassigned)
+        # if remaining > 0:
+        #     print(f"\n  Assigning {remaining} remaining vertices...")
+        #     assigned = np.where(regions > 0)[0]
+        #     for idx in np.where(unassigned)[0]:
+        #         dists = np.linalg.norm(self.points[assigned] - self.points[idx], axis=1)
+        #         regions[idx] = regions[assigned[np.argmin(dists)]]
+            
+        
+        # Smoothing and continuity enforcement
+#        print("\n" + "="*60)
+#        print("  SMOOTHING AND CONTINUITY")
+#        print("="*60)
+#        self.smooth_boundaries(regions, iterations=3)
+#        self.enforce_continuity(regions)
+#        self.smooth_boundaries(regions, iterations=2)
+#        self.enforce_continuity(regions)
+        
+        # Final review and save
         print("\n" + "="*60)
-        print("  SUMMARY")
+        print("  FINAL SUMMARY")
         print("="*60)
         for i, n in enumerate(self.extended_region_names):
             c = np.sum(regions == i)
             if c > 0:
                 print(f"  {i:2d}. {n:20s}: {c:6d}")
         
-        save = self.review_segmentation(regions)
+        action = self.review_segmentation(regions, "FINAL REVIEW", step='FINAL')
         
-        if save:
+        if action == 'discard' or action == 'quit':
+            print("\n✗ Not saved")
+            return None
+        else:
+            # Space was pressed on final review, treat as save
             self.save_results(regions, self.vtk_file.replace('.vtk', ''))
             print("\n✓ DONE!")
-        else:
-            print("\n✗ Not saved")
-        
-        return regions if save else None
+            return regions
 
 
 def main():
