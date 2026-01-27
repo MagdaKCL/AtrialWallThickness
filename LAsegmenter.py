@@ -536,7 +536,7 @@ class LASegmenter:
                             text.GetTextProperty().SetColor(1, 1, 0)
                             window.Render()
                         else:
-                            # Just accepted RSPV review, move to LSPV
+                            # Just accepted RSPV review (manual), move to LSPV
                             state['idx'] += 1
                             state['tip_id'] = None
                             state['tip_pos'] = None
@@ -625,7 +625,7 @@ class LASegmenter:
                             update_region_visualization()
                             window.Render()
                         else:
-                            # Undo RSPV - delete RSPV region and markers
+                            # Undo RSPV
                             region = 'RSPV'
                             print(f"Undoing {region} selection...")
                             
@@ -635,7 +635,7 @@ class LASegmenter:
                             # Remove ostium region (RSPV_Ostium = 13)
                             state['regions'][state['regions'] == 13] = 0
                             
-                            # Remove the marker and ring from permanent list (last 2 actors added for RSPV)
+                            # Remove the marker and ring from permanent list if they're there
                             if state['permanent']:
                                 if len(state['permanent']) >= 2:
                                     # Remove last 2: ring and marker
@@ -647,6 +647,37 @@ class LASegmenter:
                                     # Remove last 1: marker
                                     removed_marker = state['permanent'].pop()
                                     renderer.RemoveActor(removed_marker)
+                            
+                            # Remove ring and disk if they exist
+                            if state['ring']:
+                                renderer.RemoveActor(state['ring'])
+                                state['ring'] = None
+                            if state['disk']:
+                                renderer.RemoveActor(state['disk'])
+                                state['disk'] = None
+                            
+                            # Reset PV state variables for manual selection
+                            state['tip_id'] = None
+                            state['tip_pos'] = None
+                            state['plane_pos'] = None
+                            state['plane_normal'] = None
+                            state['base_normal'] = None
+                            state['radius'] = self.default_ostium_radius
+                            state['offset'] = 0
+                            state['tilt_fb'] = 0
+                            state['tilt_lr'] = 0
+                            
+                            if state['marker']:
+                                renderer.RemoveActor(state['marker'])
+                                state['marker'] = None
+                            
+                            # Exit review mode to allow manual placement
+                            state['review_mode'] = False
+                            update_text()
+                            text.GetTextProperty().SetColor(1, 1, 0)
+                            update_region_visualization()
+                            window.Render()
+                    
                             
                             # Reset PV state variables (stay at idx=4 to re-select RSPV)
                             state['tip_id'] = None
@@ -1314,11 +1345,8 @@ class LASegmenter:
                         
                         print(f"  {pv_name}_Ostium: {len(visited)}")
     
-    def create_laa_and_walls(self, regions, ellipse_center):
-        """Create wall regions (LAA already created during landmark selection)."""
-        # Create wall regions
-        print("\n2. Creating wall regions...")
-        
+    def compute_wall_geometry(self, regions, ellipse_center):
+        """Precompute all wall geometry parameters. Returns a dict with planes and axes."""
         # Get ostia centers
         ostia_centers = {}
         for pv in ['RSPV', 'LSPV', 'RIPV', 'LIPV']:
@@ -1355,7 +1383,6 @@ class LASegmenter:
         heart_center_ap = (pv_ap_component + ellipse_ap_component) / 2.0
         heart_center = pv_center + (heart_center_ap - pv_ap_component) * ap_axis
         
-        # Define posterior wall planes
         pv_quadrangle_center = (rspv_ost_center + lspv_ost_center + ripv_ost_center + lipv_ost_center) / 4.0
         
         def make_plane(p1, p2, p3):
@@ -1373,9 +1400,58 @@ class LASegmenter:
         post_left_plane_pt, post_left_plane_normal = make_plane(lspv_ost_center, lipv_ost_center, heart_center)
         post_right_plane_pt, post_right_plane_normal = make_plane(rspv_ost_center, ripv_ost_center, heart_center)
         
-        # Roof anterior plane
-        rspv_ostium = np.where(regions == 13)[0]
-        lspv_ostium = np.where(regions == 14)[0]
+        # Find bottommost vertices of RIPV and LIPV rings (PV regions, not ostium)
+        ripv_ring = np.where(regions == 3)[0]  # RIPV region
+        lipv_ring = np.where(regions == 4)[0]  # LIPV region
+        ripv_bottom_vid = None
+        lipv_bottom_vid = None
+        
+        if len(ripv_ring) > 0:
+            si_scores = np.dot(self.points[ripv_ring] - ostia_centers['RIPV'], si_axis)
+            ripv_bottom_vid = ripv_ring[np.argmin(si_scores)]  # Minimum SI = bottommost
+        
+        if len(lipv_ring) > 0:
+            si_scores = np.dot(self.points[lipv_ring] - ostia_centers['LIPV'], si_axis)
+            lipv_bottom_vid = lipv_ring[np.argmin(si_scores)]  # Minimum SI = bottommost
+        
+        # Inferior bottom plane - connects bottommost vertices of RIPV and LIPV, parallel to AP axis
+        inf_bottom_plane_pt = None
+        inf_bottom_plane_normal = None
+        if ripv_bottom_vid is not None and lipv_bottom_vid is not None:
+            p1 = self.points[ripv_bottom_vid]
+            p2 = self.points[lipv_bottom_vid]
+            # Plane parallel to AP axis: normal perpendicular to both (p2-p1) and AP axis
+            line_vec = p2 - p1
+            line_vec = line_vec / (np.linalg.norm(line_vec) + 1e-10)
+            normal = np.cross(line_vec, ap_axis)
+            normal = normal / (np.linalg.norm(normal) + 1e-10)
+            # Ensure normal points toward PV quadrangle center
+            to_center = pv_quadrangle_center - p1
+            if np.dot(normal, to_center) < 0:
+                normal = -normal
+            inf_bottom_plane_pt = p1
+            inf_bottom_plane_normal = normal
+        else:
+            # Fallback to ostium centers if ring vertices not available
+            inf_bottom_plane_pt, inf_bottom_plane_normal = make_plane(ripv_ost_center, lipv_ost_center, heart_center)
+        
+        # Inferior wall planes - use bottommost vertices of RIPV and LIPV ring boundaries
+        inf_right_plane_pt = None
+        inf_right_plane_normal = None
+        inf_left_plane_pt = None
+        inf_left_plane_normal = None
+        
+        if ripv_bottom_vid is not None:
+            p1 = self.points[ripv_bottom_vid]
+            inf_right_plane_pt, inf_right_plane_normal = make_plane(p1, ellipse_center, heart_center)
+        
+        if lipv_bottom_vid is not None:
+            p1 = self.points[lipv_bottom_vid]
+            inf_left_plane_pt, inf_left_plane_normal = make_plane(p1, ellipse_center, heart_center)
+        
+        # Roof anterior plane - use most anterior vertices of RSPV and LSPV ostium rings
+        rspv_ostium = np.where(regions == 13)[0]  # RSPV_Ostium (ostial opening boundary)
+        lspv_ostium = np.where(regions == 14)[0]  # LSPV_Ostium (ostial opening boundary)
         rspv_anterior_vid = None
         lspv_anterior_vid = None
         
@@ -1393,57 +1469,16 @@ class LASegmenter:
             p1 = self.points[rspv_anterior_vid]
             p2 = self.points[lspv_anterior_vid]
             roof_ant_plane_pt, roof_ant_plane_normal = make_plane(p1, p2, heart_center)
-            # Flip to point anterior
             to_pv = pv_quadrangle_center - p1
             if np.dot(roof_ant_plane_normal, to_pv) > 0:
                 roof_ant_plane_normal = -roof_ant_plane_normal
         
-        # Calculate distances
-        dist_post_top = self.signed_distance_to_plane(self.points, post_top_plane_pt, post_top_plane_normal)
-        dist_post_bottom = self.signed_distance_to_plane(self.points, post_bottom_plane_pt, post_bottom_plane_normal)
-        dist_post_right = self.signed_distance_to_plane(self.points, post_right_plane_pt, post_right_plane_normal)
-        dist_post_left = self.signed_distance_to_plane(self.points, post_left_plane_pt, post_left_plane_normal)
-        
-        unassigned = regions == 0
-        
-        # Posterior wall
-        post_mask = (unassigned & (dist_post_top > 0) & (dist_post_bottom > 0) & (dist_post_right > 0) & (dist_post_left > 0))
-        regions[post_mask] = 7
-        unassigned = regions == 0
-        print(f"  Posterior: {np.sum(regions == 7)}")
-        
-        # Roof anterior plane distances
-        dist_roof_ant = np.zeros(len(self.points))
-        if roof_ant_plane_pt is not None:
-            dist_roof_ant = self.signed_distance_to_plane(self.points, roof_ant_plane_pt, roof_ant_plane_normal)
-        
-        # Roof
-        ant_right_plane_pt = rspv_ost_center
-        ant_right_plane_normal = lr_axis
-        ant_left_plane_pt = lspv_ost_center
-        ant_left_plane_normal = lr_axis
-        
-        dist_ant_right = self.signed_distance_to_plane(self.points, ant_right_plane_pt, ant_right_plane_normal)
-        dist_ant_left = self.signed_distance_to_plane(self.points, ant_left_plane_pt, ant_left_plane_normal)
-        
-        roof_mask = (unassigned & (dist_post_top < 0) & (dist_roof_ant < 0) & (dist_ant_right < 0) & (dist_ant_left > 0))
-        regions[roof_mask] = 8
-        unassigned = regions == 0
-        print(f"  Roof: {np.sum(regions == 8)}")
-        
-        # Inferior
-        inferior_mask = (unassigned & (dist_post_bottom < 0) & (dist_post_right > 0) & (dist_post_left > 0))
-        regions[inferior_mask] = 9
-        unassigned = regions == 0
-        print(f"  Inferior: {np.sum(regions == 9)}")
-        
-        # Anterior wall
-        ma_center = ellipse_center
         ant_plane_right_pt = None
         ant_plane_right_normal = None
         ant_plane_left_pt = None
         ant_plane_left_normal = None
         
+        ma_center = ellipse_center
         if rspv_anterior_vid is not None and lspv_anterior_vid is not None:
             rspv_ant_pt = self.points[rspv_anterior_vid]
             lspv_ant_pt = self.points[lspv_anterior_vid]
@@ -1458,36 +1493,137 @@ class LASegmenter:
             if np.dot(ant_plane_left_normal, to_pv) > 0:
                 ant_plane_left_normal = -ant_plane_left_normal
         
+        # Septal wall plane - parallel to SI axis, passing through MA center
+        # Normal is perpendicular to SI axis (use LR axis as the plane normal)
+        septal_wall_plane_pt = ma_center
+        septal_wall_plane_normal = lr_axis
+        
+        return {
+            'ostia_centers': ostia_centers,
+            'si_axis': si_axis,
+            'ap_axis': ap_axis,
+            'lr_axis': lr_axis,
+            'heart_center': heart_center,
+            'pv_quadrangle_center': pv_quadrangle_center,
+            'rspv_ost_center': rspv_ost_center,
+            'lspv_ost_center': lspv_ost_center,
+            'ripv_ost_center': ripv_ost_center,
+            'lipv_ost_center': lipv_ost_center,
+            'post_top_plane_pt': post_top_plane_pt,
+            'post_top_plane_normal': post_top_plane_normal,
+            'post_bottom_plane_pt': post_bottom_plane_pt,
+            'post_bottom_plane_normal': post_bottom_plane_normal,
+            'post_left_plane_pt': post_left_plane_pt,
+            'post_left_plane_normal': post_left_plane_normal,
+            'post_right_plane_pt': post_right_plane_pt,
+            'post_right_plane_normal': post_right_plane_normal,
+            'inf_bottom_plane_pt': inf_bottom_plane_pt,
+            'inf_bottom_plane_normal': inf_bottom_plane_normal,
+            'inf_right_plane_pt': inf_right_plane_pt,
+            'inf_right_plane_normal': inf_right_plane_normal,
+            'inf_left_plane_pt': inf_left_plane_pt,
+            'inf_left_plane_normal': inf_left_plane_normal,
+            'roof_ant_plane_pt': roof_ant_plane_pt,
+            'roof_ant_plane_normal': roof_ant_plane_normal,
+            'ant_plane_right_pt': ant_plane_right_pt,
+            'ant_plane_right_normal': ant_plane_right_normal,
+            'ant_plane_left_pt': ant_plane_left_pt,
+            'ant_plane_left_normal': ant_plane_left_normal,
+            'septal_wall_plane_pt': septal_wall_plane_pt,
+            'septal_wall_plane_normal': septal_wall_plane_normal,
+        }
+    
+    def create_posterior_wall(self, regions, geom):
+        """Create posterior wall region (rid=7)."""
+        dist_post_top = self.signed_distance_to_plane(self.points, geom['post_top_plane_pt'], geom['post_top_plane_normal'])
+        dist_post_bottom = self.signed_distance_to_plane(self.points, geom['post_bottom_plane_pt'], geom['post_bottom_plane_normal'])
+        dist_post_right = self.signed_distance_to_plane(self.points, geom['post_right_plane_pt'], geom['post_right_plane_normal'])
+        dist_post_left = self.signed_distance_to_plane(self.points, geom['post_left_plane_pt'], geom['post_left_plane_normal'])
+        
+        unassigned = regions == 0
+        post_mask = (unassigned & (dist_post_top > 0) & (dist_post_bottom > 0) & (dist_post_right > 0) & (dist_post_left > 0))
+        regions[post_mask] = 7
+        print(f"  Posterior: {np.sum(regions == 7)}")
+    
+    def create_roof_wall(self, regions, geom):
+        """Create roof wall region (rid=8)."""
+        dist_post_top = self.signed_distance_to_plane(self.points, geom['post_top_plane_pt'], geom['post_top_plane_normal'])
+        dist_post_right = self.signed_distance_to_plane(self.points, geom['post_right_plane_pt'], geom['post_right_plane_normal'])
+        dist_post_left = self.signed_distance_to_plane(self.points, geom['post_left_plane_pt'], geom['post_left_plane_normal'])
+        
+        dist_roof_ant = np.zeros(len(self.points))
+        if geom['roof_ant_plane_pt'] is not None:
+            dist_roof_ant = self.signed_distance_to_plane(self.points, geom['roof_ant_plane_pt'], geom['roof_ant_plane_normal'])
+        
+        dist_ant_right = self.signed_distance_to_plane(self.points, geom['rspv_ost_center'], geom['lr_axis'])
+        dist_ant_left = self.signed_distance_to_plane(self.points, geom['lspv_ost_center'], geom['lr_axis'])
+        
+        unassigned = regions == 0
+        roof_mask = (unassigned & (dist_post_top < 0) & (dist_roof_ant < 0) & (dist_ant_right < 0) & (dist_ant_left > 0))
+        regions[roof_mask] = 8
+        print(f"  Roof: {np.sum(regions == 8)}")
+    
+    def create_inferior_wall(self, regions, geom):
+        """Create inferior wall region (rid=9)."""
+        dist_inf_right = self.signed_distance_to_plane(self.points, geom['inf_right_plane_pt'], geom['inf_right_plane_normal'])
+        dist_inf_left = self.signed_distance_to_plane(self.points, geom['inf_left_plane_pt'], geom['inf_left_plane_normal'])
+        
+        unassigned = regions == 0
+        inferior_mask = (unassigned & ((dist_inf_right > 0) & (dist_inf_left < 0)))
+        regions[inferior_mask] = 9
+        print(f"  Inferior: {np.sum(regions == 9)}")
+    
+    def create_anterior_wall(self, regions, geom):
+        """Create anterior wall region (rid=12)."""
+        dist_roof_ant = np.zeros(len(self.points))
+        if geom['roof_ant_plane_pt'] is not None:
+            dist_roof_ant = self.signed_distance_to_plane(self.points, geom['roof_ant_plane_pt'], geom['roof_ant_plane_normal'])
+        
         dist_ant_right = np.zeros(len(self.points))
         dist_ant_left = np.zeros(len(self.points))
-        if ant_plane_right_pt is not None:
-            dist_ant_right = self.signed_distance_to_plane(self.points, ant_plane_right_pt, ant_plane_right_normal)
-        if ant_plane_left_pt is not None:
-            dist_ant_left = self.signed_distance_to_plane(self.points, ant_plane_left_pt, ant_plane_left_normal)
+        if geom['ant_plane_right_pt'] is not None:
+            dist_ant_right = self.signed_distance_to_plane(self.points, geom['ant_plane_right_pt'], geom['ant_plane_right_normal'])
+        if geom['ant_plane_left_pt'] is not None:
+            dist_ant_left = self.signed_distance_to_plane(self.points, geom['ant_plane_left_pt'], geom['ant_plane_left_normal'])
         
+        unassigned = regions == 0
         anterior_mask = (unassigned & (dist_roof_ant > 0) & (dist_ant_right < 0) & (dist_ant_left > 0))
+
         regions[anterior_mask] = 12
-        unassigned = regions == 0
         print(f"  Anterior: {np.sum(regions == 12)}")
+    
+    def create_septal_wall(self, regions, geom):
+        """Create septal wall region (rid=11)."""
+        dist_septal_wall = self.signed_distance_to_plane(self.points, geom['septal_wall_plane_pt'], geom['septal_wall_plane_normal'])
         
-        # Septal
-        septal_mask = (unassigned & (dist_post_right < 0))
+        unassigned = regions == 0
+        septal_mask = (unassigned & (dist_septal_wall > 0))
         regions[septal_mask] = 11
-        unassigned = regions == 0
         print(f"  Septal: {np.sum(regions == 11)}")
+    
+    def create_lateral_wall(self, regions, geom):
+        """Create lateral wall region (rid=10)."""
+        dist_septal_wall = self.signed_distance_to_plane(self.points, geom['septal_wall_plane_pt'], geom['septal_wall_plane_normal'])        
         
-        # Lateral
-        laa_center = self.markers['LAA_ostium']['coords']
-        dist_laa_boundary = self.signed_distance_to_plane(self.points, laa_center, lr_axis)
-        
-        lateral_mask = (unassigned & (dist_laa_boundary > 0) & (dist_post_left < 0))
-        if np.sum(lateral_mask) == 0:
-            lateral_mask = (unassigned & (dist_laa_boundary > 0))
-        regions[lateral_mask] = 10
         unassigned = regions == 0
+        lateral_mask = (unassigned & (dist_septal_wall < 0))
+        regions[lateral_mask] = 10
         print(f"  Lateral: {np.sum(regions == 10)}")
     
-    def review_segmentation(self, regions, title="SEGMENTATION REVIEW", step=None):
+    def create_laa_and_walls(self, regions, ellipse_center):
+        """Create wall regions (LAA already created during landmark selection)."""
+        print("\n2. Creating wall regions...")
+        geom = self.compute_wall_geometry(regions, ellipse_center)
+        
+        self.create_posterior_wall(regions, geom)
+        self.create_roof_wall(regions, geom)
+        self.create_inferior_wall(regions, geom)
+        self.create_anterior_wall(regions, geom)
+        self.create_lateral_wall(regions, geom)
+        self.create_septal_wall(regions, geom)
+    
+
+    def review_segmentation(self, regions, title="SEGMENTATION REVIEW", step=None, wall_rid=None, geom=None):
         """Review segmentation with navigation controls. Returns 'next' to proceed, 'undo' to go back."""
         print("\n" + "="*60)
         print(f"  {title}")
@@ -1496,6 +1632,7 @@ class LASegmenter:
         is_final_review = (step == 'FINAL')
         is_veins_review = (step == 'VEINS')
         is_walls_review = (step == 'WALLS')
+        is_wall_single = (step == 'WALL_SINGLE')
         
         if is_final_review:
             help_text = "SPACE=save, ESC=discard"
@@ -1505,6 +1642,9 @@ class LASegmenter:
             print(f"\n{help_text}\n")
         elif is_walls_review:
             help_text = "SPACE=continue, ESC=redo walls"
+            print(f"\n{help_text}\n")
+        elif is_wall_single:
+            help_text = "SPACE=accept, ESC=redo this wall"
             print(f"\n{help_text}\n")
         else:
             help_text = "SPACE=continue, ESC=undo"
@@ -1541,6 +1681,10 @@ class LASegmenter:
         
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
+        
+        # Make mesh fully opaque for wall visualization
+        actor.GetProperty().SetOpacity(1.0)
+        
         renderer.AddActor(actor)
         
         # Add text display for title and keybindings
@@ -1827,21 +1971,43 @@ class LASegmenter:
         except:
             ellipse_center = (ma_p1 + ma_p2 + ma_p3 + ma_p4) / 4.0
         
-        # Create walls with undo support
-        while True:
-            print("\n" + "="*60)
-            print("  CREATE WALL REGIONS")
-            print("="*60)
-            self.create_laa_and_walls(regions, ellipse_center)
-            
-            action = self.review_segmentation(regions, "WALLS REVIEW BEFORE OPTIMIZATION", step='WALLS')
-            if action == 'undo':
-                # Delete all wall regions (7-12)
-                for rid in range(7, 13):
-                    regions[regions == rid] = 0
-                print("⚠ Wall regions deleted. Creating walls again...\n")
-                continue
-            break
+        # Create walls with per-wall review
+        wall_sequence = [
+            ('Posterior', self.create_posterior_wall, 7),
+            ('Roof', self.create_roof_wall, 8),
+            ('Inferior', self.create_inferior_wall, 9),
+            ('Anterior', self.create_anterior_wall, 12),
+            ('Lateral', self.create_lateral_wall, 10),
+            ('Septal', self.create_septal_wall, 11)
+        ]
+        
+        geom = self.compute_wall_geometry(regions, ellipse_center)
+        
+        for wall_idx, (wall_name, create_func, wall_rid) in enumerate(wall_sequence):
+            while True:
+                print("\n" + "="*60)
+                print(f"  CREATE {wall_name.upper()} WALL")
+                print("="*60)
+                
+                # Create the wall
+                create_func(regions, geom)
+                
+                # Determine if this is the last wall
+                is_last_wall = (wall_idx == len(wall_sequence) - 1)
+                next_stage = "FINAL REVIEW" if is_last_wall else f"next wall"
+                
+                # Review this wall
+                action = self.review_segmentation(regions, f"{wall_name.upper()} WALL REVIEW", step='WALL_SINGLE', wall_rid=wall_rid, geom=geom)
+                
+                if action == 'undo':
+                    # Delete this wall region
+                    regions[regions == wall_rid] = 0
+                    print(f"⚠ {wall_name} wall deleted. Creating again...\n")
+                    continue
+                else:
+                    # Accept this wall and move to next
+                    break
+        
 
         # Assign remaining vertices to nearest region
         # unassigned = regions == 0
