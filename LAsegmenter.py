@@ -1604,7 +1604,7 @@ class LASegmenter:
     def create_lateral_wall(self, regions, geom):
         """Create lateral wall region (rid=10)."""
         dist_septal_wall = self.signed_distance_to_plane(self.points, geom['septal_wall_plane_pt'], geom['septal_wall_plane_normal'])        
-        
+
         unassigned = regions == 0
         lateral_mask = (unassigned & (dist_septal_wall < 0))
         regions[lateral_mask] = 10
@@ -1983,51 +1983,63 @@ class LASegmenter:
         
         geom = self.compute_wall_geometry(regions, ellipse_center)
         
+        # Create all walls without per-wall review (single wall review disabled for now)
+        # TODO: Re-enable individual wall reviews in future for debugging purposes
         for wall_idx, (wall_name, create_func, wall_rid) in enumerate(wall_sequence):
-            while True:
-                print("\n" + "="*60)
-                print(f"  CREATE {wall_name.upper()} WALL")
-                print("="*60)
-                
-                # Create the wall
-                create_func(regions, geom)
-                
-                # Determine if this is the last wall
-                is_last_wall = (wall_idx == len(wall_sequence) - 1)
-                next_stage = "FINAL REVIEW" if is_last_wall else f"next wall"
-                
-                # Review this wall
-                action = self.review_segmentation(regions, f"{wall_name.upper()} WALL REVIEW", step='WALL_SINGLE', wall_rid=wall_rid, geom=geom)
-                
-                if action == 'undo':
-                    # Delete this wall region
-                    regions[regions == wall_rid] = 0
-                    print(f"⚠ {wall_name} wall deleted. Creating again...\n")
-                    continue
-                else:
-                    # Accept this wall and move to next
-                    break
+            print("\n" + "="*60)
+            print(f"  CREATE {wall_name.upper()} WALL")
+            print("="*60)
+            
+            # Create the wall
+            create_func(regions, geom)
         
+        # Commented out: Per-wall review loop (kept for future debugging)
+        # for wall_idx, (wall_name, create_func, wall_rid) in enumerate(wall_sequence):
+        #     while True:
+        #         print("\n" + "="*60)
+        #         print(f"  CREATE {wall_name.upper()} WALL")
+        #         print("="*60)
+        #         
+        #         # Create the wall
+        #         create_func(regions, geom)
+        #         
+        #         # Determine if this is the last wall
+        #         is_last_wall = (wall_idx == len(wall_sequence) - 1)
+        #         next_stage = "FINAL REVIEW" if is_last_wall else f"next wall"
+        #         
+        #         # Review this wall
+        #         action = self.review_segmentation(regions, f"{wall_name.upper()} WALL REVIEW", step='WALL_SINGLE', wall_rid=wall_rid, geom=geom)
+        #         
+        #         if action == 'undo':
+        #             # Delete this wall region
+        #             regions[regions == wall_rid] = 0
+        #             print(f"⚠ {wall_name} wall deleted. Creating again...\n")
+        #             continue
+        #         else:
+        #             # Accept this wall and move to next
+        #             break
+        
+        action = self.review_segmentation(regions, "WALL REVIEW - before smoothing", step='WALLS')
 
         # Assign remaining vertices to nearest region
-        # unassigned = regions == 0
-        # remaining = np.sum(unassigned)
-        # if remaining > 0:
-        #     print(f"\n  Assigning {remaining} remaining vertices...")
-        #     assigned = np.where(regions > 0)[0]
-        #     for idx in np.where(unassigned)[0]:
-        #         dists = np.linalg.norm(self.points[assigned] - self.points[idx], axis=1)
-        #         regions[idx] = regions[assigned[np.argmin(dists)]]
+        unassigned = regions == 0
+        remaining = np.sum(unassigned)
+        if remaining > 0:
+            print(f"\n  Assigning {remaining} remaining vertices...")
+            assigned = np.where(regions > 0)[0]
+            for idx in np.where(unassigned)[0]:
+                dists = np.linalg.norm(self.points[assigned] - self.points[idx], axis=1)
+                regions[idx] = regions[assigned[np.argmin(dists)]]
             
         
         # Smoothing and continuity enforcement
-#        print("\n" + "="*60)
-#        print("  SMOOTHING AND CONTINUITY")
-#        print("="*60)
-#        self.smooth_boundaries(regions, iterations=3)
-#        self.enforce_continuity(regions)
-#        self.smooth_boundaries(regions, iterations=2)
-#        self.enforce_continuity(regions)
+        print("\n" + "="*60)
+        print("  SMOOTHING AND CONTINUITY")
+        print("="*60)
+        self.smooth_boundaries(regions, iterations=3)
+        self.enforce_continuity(regions)
+        self.smooth_boundaries(regions, iterations=2)
+        self.enforce_continuity(regions)
         
         # Final review and save
         print("\n" + "="*60)
