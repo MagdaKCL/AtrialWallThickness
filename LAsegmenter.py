@@ -1015,13 +1015,29 @@ class LASegmenter:
         interactor.AddObserver('LeftButtonPressEvent', on_click)
         interactor.AddObserver('KeyPressEvent', on_key)
         
+        # Close window to terminate program
+        def on_window_close(obj, event):
+            print("\n✗ Window closed. Terminating program.")
+            state['exit_reason'] = 'window_closed'
+            window.Finalize()
+            interactor.TerminateApp()
+        
+        interactor.AddObserver('WinCloseEvent', on_window_close)
+        
         window.SetWindowName("LA Segmenter - Landmarks")
         interactor.Initialize()
         window.Render()
         interactor.Start()
         
+        # If window was closed, ensure we return window_closed regardless of other state
+        if state['exit_reason'] is None:
+            # Window closed without going through normal exit paths
+            return state['regions'], 'window_closed'
+        
         # Check why we exited
-        if state['exit_reason'] == 'MA':
+        if state['exit_reason'] == 'window_closed':
+            return state['regions'], 'window_closed'
+        elif state['exit_reason'] == 'MA':
             return state['regions'], 'MA'
         elif state['exit_reason'] == 'all_done':
             return state['regions'], None
@@ -1300,7 +1316,8 @@ class LASegmenter:
         
         connected = self.find_connected_component(tip_id, candidates)
         for vid in connected:
-            regions[vid] = pv_rid
+            if regions[vid] == 0:
+                regions[vid] = pv_rid
         
         print(f"  {pv_name}: {len(connected)}")
         
@@ -1380,7 +1397,8 @@ class LASegmenter:
         
         pv_ap_component = np.dot(pv_center, ap_axis)
         ellipse_ap_component = np.dot(ellipse_center, ap_axis)
-        heart_center_ap = (pv_ap_component + ellipse_ap_component) / 2.0
+        
+        heart_center_ap = (pv_ap_component*0.7 + ellipse_ap_component*0.3) 
         heart_center = pv_center + (heart_center_ap - pv_ap_component) * ap_axis
         
         pv_quadrangle_center = (rspv_ost_center + lspv_ost_center + ripv_ost_center + lipv_ost_center) / 4.0
@@ -1641,7 +1659,7 @@ class LASegmenter:
             help_text = "SPACE=continue, 's'=checkpoint"
             print(f"\n{help_text}\n")
         elif is_walls_review:
-            help_text = "SPACE=continue, ESC=redo walls"
+            help_text = "SPACE=continue, ESC=exit the program"
             print(f"\n{help_text}\n")
         elif is_wall_single:
             help_text = "SPACE=accept, ESC=redo this wall"
@@ -1686,6 +1704,37 @@ class LASegmenter:
         actor.GetProperty().SetOpacity(1.0)
         
         renderer.AddActor(actor)
+        
+        # Visualize roof anterior plane if walls review and geom available
+        if is_walls_review and geom is not None:
+            if geom['roof_ant_plane_pt'] is not None and geom['roof_ant_plane_normal'] is not None:
+                # Create two orthogonal vectors in the plane for proper visualization
+                plane_pt = geom['roof_ant_plane_pt']
+                plane_normal = geom['roof_ant_plane_normal']
+                
+                # Create orthogonal basis vectors in the plane
+                if abs(plane_normal[2]) < 0.9:
+                    v1 = np.cross(plane_normal, np.array([0, 0, 1]))
+                else:
+                    v1 = np.cross(plane_normal, np.array([0, 1, 0]))
+                v1 = v1 / (np.linalg.norm(v1) + 1e-10)
+                v2 = np.cross(plane_normal, v1)
+                v2 = v2 / (np.linalg.norm(v2) + 1e-10)
+                
+                # Three points on the plane to define it
+                p1 = plane_pt
+                p2 = plane_pt + v1 * 30
+                p3 = plane_pt + v2 * 30
+                
+                roof_ant_actor, roof_ant_edges = self.create_posterior_wall_plane_actors(
+                    p1, p2, p3,
+                    plane_normal,
+                    (1, 1, 0),  # Yellow for roof anterior plane
+                    plane_size=30
+                )
+                renderer.AddActor(roof_ant_actor)
+                renderer.AddActor(roof_ant_edges)
+                print(f"✓ Roof anterior plane visualized (yellow) at {plane_pt}")
         
         # Add text display for title and keybindings
         text_actor = vtk.vtkTextActor()
@@ -1736,11 +1785,28 @@ class LASegmenter:
         
         interactor.AddObserver('KeyPressEvent', on_key)
         
+        # Close window to terminate program
+        def on_window_close(obj, event):
+            print("\n✗ Window closed. Terminating program.")
+            state['action'] = 'window_closed'
+            window.Finalize()
+            interactor.TerminateApp()
+        
+        interactor.AddObserver('WinCloseEvent', on_window_close)
+        
         window.SetWindowName(title)
         interactor.Initialize()
         window.Render()
         interactor.Start()
         
+        # If window was closed, ensure we return window_closed regardless of state
+        if state['action'] is None:
+            print("DEBUG: state['action'] is None after interactor.Start()")
+            return 'window_closed'
+        
+        # If window was closed, return window_closed regardless
+        if state['action'] == 'window_closed':
+            return 'window_closed'
         return state['action'] if state['action'] is not None else 'next'
     
     def create_boundary_actor(self, regions):
@@ -1952,7 +2018,23 @@ class LASegmenter:
             self.build_graph()
             regions, last_pv = self.select_landmarks_interactive()
         
-        action = self.review_segmentation(regions, "VEIGNS FINAL REVIEW - for save", step='VEINS')
+        # Initialize last_pv for checkpoint loading path
+        if 'last_pv' not in locals():
+            last_pv = None
+        
+        # Check if window was closed during landmark selection
+        if last_pv == 'window_closed':
+            print("\n✗ Program terminated by user during landmark selection.")
+            return None
+        
+        print(f"\nDEBUG: After landmarks, last_pv = {last_pv}")
+        action = self.review_segmentation(regions, "VEINS FINAL REVIEW - for save", step='VEINS')
+        print(f"DEBUG: After veins review, action = {action}")
+        
+        # Check if window was closed during veins review
+        if action == 'window_closed':
+            print("\n✗ Program terminated by user.")
+            return None
 
         # Extract ellipse center from MA points for wall creation
         ma_p1 = self.markers['MA_point1']['coords']
@@ -2019,7 +2101,12 @@ class LASegmenter:
         #             # Accept this wall and move to next
         #             break
         
-        action = self.review_segmentation(regions, "WALL REVIEW - before smoothing", step='WALLS')
+        action = self.review_segmentation(regions, "WALL REVIEW - before smoothing", step='WALLS', geom=geom)
+        
+        # Check if user pressed ESC to quit or closed window
+        if action == 'undo' or action == 'window_closed':
+            print("\n✗ Program terminated by user.")
+            return None
 
         # Assign remaining vertices to nearest region
         unassigned = regions == 0
@@ -2052,7 +2139,10 @@ class LASegmenter:
         
         action = self.review_segmentation(regions, "FINAL REVIEW", step='FINAL')
         
-        if action == 'discard' or action == 'quit':
+        if action == 'window_closed':
+            print("\n✗ Program terminated by user.")
+            return None
+        elif action == 'discard' or action == 'quit':
             print("\n✗ Not saved")
             return None
         else:
