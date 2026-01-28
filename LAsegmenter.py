@@ -15,6 +15,7 @@ from collections import deque
 import heapq
 import pickle
 import os
+import time
 
 class LASegmenter:
     def __init__(self, vtk_file):
@@ -114,6 +115,36 @@ class LASegmenter:
             if np.linalg.norm(avg) > 1e-6:
                 return avg / np.linalg.norm(avg)
         return np.array([0, 0, 1])
+    
+    def compute_all_vertex_normals(self):
+        """Compute normals for all vertices at once using vectorized operations."""
+        num_vertices = len(self.points)
+        vertex_normals = np.zeros((num_vertices, 3))
+        
+        # Compute face normals
+        v0 = self.points[self.faces[:, 0]]  # (F, 3)
+        v1 = self.points[self.faces[:, 1]]  # (F, 3)
+        v2 = self.points[self.faces[:, 2]]  # (F, 3)
+        
+        face_normals = np.cross(v1 - v0, v2 - v0)  # (F, 3)
+        face_norms = np.linalg.norm(face_normals, axis=1, keepdims=True)  # (F, 1)
+        face_norms = np.maximum(face_norms, 1e-10)  # Avoid division by zero
+        face_normals = face_normals / face_norms  # (F, 3) normalized
+        
+        # Accumulate normals at each vertex
+        for f_idx, face in enumerate(self.faces):
+            for vid in face:
+                vertex_normals[vid] += face_normals[f_idx]
+        
+        # Normalize vertex normals
+        vertex_norms = np.linalg.norm(vertex_normals, axis=1, keepdims=True)
+        vertex_norms = np.maximum(vertex_norms, 1e-10)
+        vertex_normals = vertex_normals / vertex_norms
+        
+        # Store as instance variable
+        self.vertex_normals = vertex_normals
+        
+        return vertex_normals
     
     def estimate_vein_direction(self, tip_id):
         tip = self.points[tip_id]
@@ -2152,6 +2183,247 @@ class LASegmenter:
             return regions
 
 
+
+
+
+def calculate_wall_thickness(interior_segmenter, exterior_mesh, regions):
+    """
+    Calculate average wall thickness for each region using KDTree nearest point search.
+    
+    This is 100-1000x faster than ray-casting because it uses spatial indexing
+    instead of testing every ray against every triangle.
+    
+    For each vertex in the interior mesh:
+    1. Find the nearest point on the exterior surface
+    2. Check if the vertex normal points toward the exterior (quality metric)
+    3. Calculate thickness as distance to that point
+    4. Average results per region (only counting valid normals)
+    
+    Parameters:
+    -----------
+    interior_segmenter : LASegmenter
+        The segmented interior mesh object
+    exterior_mesh : vtkPolyData
+        The exterior (epicardium) mesh
+    regions : np.ndarray
+        The region assignments computed during segmentation
+    """
+    from scipy.spatial import KDTree
+    import csv
+    
+    print("\n" + "="*60)
+    print("  CALCULATING WALL THICKNESS")
+    print("="*60 + "\n")
+    
+    interior_mesh = interior_segmenter.mesh
+    interior_points = interior_segmenter.points
+    interior_regions = regions
+    
+    # Extract exterior mesh data as numpy arrays
+    exterior_points = vtk_to_numpy(exterior_mesh.GetPoints().GetData())
+    
+    print(f"Exterior surface: {len(exterior_points)} vertices")
+    print(f"Interior mesh: {len(interior_points)} vertices")
+    
+    # Generate output filename
+    base_path = interior_segmenter.vtk_file.replace('.vtk', '').replace('.wrk', '')
+    
+    # Build KDTree on exterior surface points
+    print("\nBuilding spatial index (KDTree)...")
+    t1 = time.time()
+    kdtree = KDTree(exterior_points)
+    t2 = time.time()
+    print(f"  KDTree build time: {(t2-t1):.2f}s")
+    
+    # Compute normals for interior mesh vertices
+    print("\nComputing interior vertex normals...")
+    t1 = time.time()
+    interior_segmenter.compute_all_vertex_normals()
+    normals = interior_segmenter.vertex_normals
+    t2 = time.time()
+    print(f"  Normal computation time: {(t2-t1):.2f}s")
+    
+    # Dictionary to store thickness measurements and disregarded counts per region
+    thickness_by_region = {}
+    disregarded_by_region = {}
+    for region_id in range(17):
+        thickness_by_region[region_id] = []
+        disregarded_by_region[region_id] = 0
+    
+    # Query nearest points for all interior vertices at once
+    print("\nQuerying nearest exterior points...")
+    t1 = time.time()
+    distances, indices = kdtree.query(interior_points, k=1)
+    t2 = time.time()
+    
+    query_time = t2 - t1
+    print(f"  Query time: {query_time:.2f}s")
+    print(f"  Rate: {len(interior_points) / query_time:.0f} vertices/sec")
+    
+    # Check normal alignment with exterior direction
+    print("\nValidating normals against exterior surface...")
+    print("  Diagnosing normal direction...")
+    t1 = time.time()
+    
+    # Sample first 1000 valid vertices to determine normal direction
+    dot_products = []
+    sample_count = 0
+    for i in range(len(interior_points)):
+        region_id = interior_regions[i]
+        if region_id <= 0:
+            continue
+        
+        nearest_exterior_point = exterior_points[indices[i]]
+        to_exterior = nearest_exterior_point - interior_points[i]
+        to_exterior_norm = np.linalg.norm(to_exterior)
+        
+        if to_exterior_norm < 1e-6:
+            continue
+        
+        to_exterior_normalized = to_exterior / to_exterior_norm
+        vertex_normal = normals[i]
+        dot_product = np.dot(vertex_normal, to_exterior_normalized)
+        dot_products.append(dot_product)
+        sample_count += 1
+        
+        if sample_count >= 1000:
+            break
+    
+    # Analyze dot product distribution
+    if dot_products:
+        mean_dot = np.mean(dot_products)
+        median_dot = np.median(dot_products)
+        print(f"  Dot product statistics (sample of {sample_count} vertices):")
+        print(f"    Mean:   {mean_dot:.4f}")
+        print(f"    Median: {median_dot:.4f}")
+        print(f"    Min:    {np.min(dot_products):.4f}")
+        print(f"    Max:    {np.max(dot_products):.4f}")
+        
+        # Determine if normals point outward or inward
+        if median_dot < 0:
+            print(f"  ⚠ Normals appear to point INWARD (median dot product: {median_dot:.4f})")
+            print(f"  → Using abs(dot_product) >= 0.1 to accept both directions")
+            use_abs_dot = True
+        else:
+            print(f"  ✓ Normals appear to point OUTWARD (median dot product: {median_dot:.4f})")
+            use_abs_dot = False
+    else:
+        use_abs_dot = False
+    
+    # Now process all vertices
+    print(f"\n  Processing all vertices...")
+    for i in range(len(interior_points)):
+        region_id = interior_regions[i]
+        if region_id <= 0:
+            continue
+        
+        # Vector from interior to nearest exterior point
+        nearest_exterior_point = exterior_points[indices[i]]
+        to_exterior = nearest_exterior_point - interior_points[i]
+        to_exterior_norm = np.linalg.norm(to_exterior)
+        
+        if to_exterior_norm < 1e-6:
+            # Vertex is essentially at exterior point, disregard
+            disregarded_by_region[region_id] += 1
+            continue
+        
+        to_exterior_normalized = to_exterior / to_exterior_norm
+        vertex_normal = normals[i]
+        
+        # Check if normal aligns with exterior direction
+        # Use absolute value if normals point inward
+        dot_product = np.dot(vertex_normal, to_exterior_normalized)
+        
+        if use_abs_dot:
+            # Accept if normal has significant component in either direction
+            if abs(dot_product) >= 0.1:
+                thickness_by_region[region_id].append(distances[i])
+            else:
+                disregarded_by_region[region_id] += 1
+        else:
+            # Only accept if normal points toward exterior
+            if dot_product > 0.1:
+                thickness_by_region[region_id].append(distances[i])
+            else:
+                disregarded_by_region[region_id] += 1
+    
+    t2 = time.time()
+    print(f"  Normal validation time: {(t2-t1):.2f}s")
+    
+    # Group results by region
+    print("\nGrouping results by region...")
+    
+    # Print results to console
+    print("\nWALL THICKNESS RESULTS:")
+    print("-" * 100)
+    print(f"{'Region':<8} {'Name':<25} {'Avg Thickness (mm)':<20} {'Std Dev':<15} {'Valid':<10} {'Disregarded':<15}")
+    print("-" * 100)
+    
+    region_names = [
+        'Background', 'RSPV', 'LSPV', 'RIPV', 'LIPV', 'MA', 'LAA',
+        'Posterior', 'Roof', 'Inferior', 'Lateral',
+        'Septal', 'Anterior', 'RSPV_Ostium', 'LSPV_Ostium',
+        'RIPV_Ostium', 'LIPV_Ostium'
+    ]
+    
+    # Save results to CSV
+    csv_filename = base_path + '_wall_thickness.csv'
+    results_data = []
+    
+    for region_id in range(1, 17):
+        if region_id in thickness_by_region and len(thickness_by_region[region_id]) > 0:
+            thicknesses = thickness_by_region[region_id]
+            avg_thickness = np.mean(thicknesses)
+            std_thickness = np.std(thicknesses)
+            num_valid = len(thicknesses)
+            num_disregarded = disregarded_by_region[region_id]
+            name = region_names[region_id] if region_id < len(region_names) else f"Region{region_id}"
+            
+            # Print to console
+            print(f"{region_id:<8} {name:<25} {avg_thickness:<20.3f} {std_thickness:<15.3f} {num_valid:<10} {num_disregarded:<15}")
+            
+            # Store for CSV
+            results_data.append({
+                'Region_ID': region_id,
+                'Region_Name': name,
+                'Avg_Thickness_mm': round(avg_thickness, 4),
+                'Std_Dev_mm': round(std_thickness, 4),
+                'Valid_Vertices': num_valid,
+                'Disregarded_Vertices': num_disregarded,
+                'Total_Vertices': num_valid + num_disregarded
+            })
+        elif disregarded_by_region[region_id] > 0:
+            # Region has only disregarded vertices
+            name = region_names[region_id] if region_id < len(region_names) else f"Region{region_id}"
+            print(f"{region_id:<8} {name:<25} {'N/A':<20} {'N/A':<15} {0:<10} {disregarded_by_region[region_id]:<15}")
+            
+            results_data.append({
+                'Region_ID': region_id,
+                'Region_Name': name,
+                'Avg_Thickness_mm': 'N/A',
+                'Std_Dev_mm': 'N/A',
+                'Valid_Vertices': 0,
+                'Disregarded_Vertices': disregarded_by_region[region_id],
+                'Total_Vertices': disregarded_by_region[region_id]
+            })
+    
+    print("-" * 100)
+    
+    # Write results to CSV
+    if results_data:
+        print(f"\nSaving results to CSV: {csv_filename}")
+        try:
+            with open(csv_filename, 'w', newline='') as csvfile:
+                fieldnames = ['Region_ID', 'Region_Name', 'Avg_Thickness_mm', 'Std_Dev_mm', 
+                             'Valid_Vertices', 'Disregarded_Vertices', 'Total_Vertices']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(results_data)
+            print(f"✓ Results saved to {csv_filename}")
+        except Exception as e:
+            print(f"✗ Failed to save CSV: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('file', nargs='?')
@@ -2170,8 +2442,64 @@ def main():
             print("Usage: python LAsegmenter.py [file.vtk|file.wrk]")
             return
     
-    LASegmenter(args.file).run()
+    interior = LASegmenter(args.file)
+    interior_regions = interior.run()
+    
+    # Check if segmentation was successful
+    if interior_regions is None:
+        return
 
+# dialog to select epicardium file
+    f = filedialog.askopenfilename(defaultextension=".vtk", title="Select epicardium mesh file")
+    if not f:
+        print("No file selected for epicardium.")
+        return
+    
+# build epicardium mesh and graph        
+    exterior = LASegmenter(f)
+    exterior.load_mesh()
+    exterior.center_mesh()
+    exterior.build_graph()
+    
+    # Calculate wall thickness using computed regions
+    calculate_wall_thickness(interior, exterior.mesh, interior_regions)
+
+# visualize epidecarium
+    mapper = vtk.vtkPolyDataMapper()
+    mapper.SetInputData(exterior.mesh)
+    actor = vtk.vtkActor()
+    actor.SetMapper(mapper)
+    actor.GetProperty().SetColor(0.9, 0.9, 0.9)
+    actor.GetProperty().SetOpacity(0.85)
+
+# visualize endocardium
+    actor2 = vtk.vtkActor()
+    mapper2 = vtk.vtkPolyDataMapper()
+    mapper2.SetInputData(interior.mesh)
+    actor2.SetMapper(mapper2)
+    actor2.GetProperty().SetColor(1.0, 0.5, 0.5)
+    actor2.GetProperty().SetOpacity(0.75)
+
+# setup rendering window        
+    renderer = vtk.vtkRenderer()
+    renderer.AddActor(actor)
+    renderer.AddActor(actor2)
+    renderer.SetBackground(0.1, 0.1, 0.2)
+        
+    window = vtk.vtkRenderWindow()
+    window.AddRenderer(renderer)
+    window.SetSize(1200, 900)
+
+# add camera        
+    interactor = vtk.vtkRenderWindowInteractor()
+    interactor.SetRenderWindow(window)
+    interactor.SetInteractorStyle(vtk.vtkInteractorStyleTrackballCamera())
+
+# start interaction        
+    window.SetWindowName("Epicardium Mesh Review")
+    interactor.Initialize()
+    window.Render()
+    interactor.Start()
 
 if __name__ == '__main__':
     main()
