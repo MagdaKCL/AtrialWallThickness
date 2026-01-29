@@ -1259,8 +1259,15 @@ class LASegmenter:
                 break
     
     def create_ma_region(self, regions):
-        """Create MA region from MA points. Returns ellipse_center for later use."""
-        print("\n1. Creating MA region...")
+        """Create MA region from MA points as a 3D ellipsoid.
+        
+        The ellipsoid is defined by:
+        - Axis 1: Major axis from the 4 points (length = distance from center to p2)
+        - Axis 2: Minor axis from the 4 points (length = distance from center to p4)
+        - Axis 3: Perpendicular to the 4-point plane
+                  (length = (major_axis_length + minor_axis_length)/4.0)
+        """
+        print("\n1. Creating MA region (3D Ellipsoid)...")
         
         ma_p1 = self.markers['MA_point1']['coords']
         ma_p2 = self.markers['MA_point2']['coords']
@@ -1303,35 +1310,69 @@ class LASegmenter:
         else:
             axis1 = d1 / np.linalg.norm(d1) if np.linalg.norm(d1) > 1e-6 else np.array([1, 0, 0])
         
+        # Orthogonalize axis2 with respect to axis1 (Gram-Schmidt)
         if np.linalg.norm(diag2_in_plane) > 1e-6:
-            axis2 = diag2_in_plane / np.linalg.norm(diag2_in_plane)
+            axis2_candidate = diag2_in_plane / np.linalg.norm(diag2_in_plane)
         else:
-            axis2 = d2 / np.linalg.norm(d2) if np.linalg.norm(d2) > 1e-6 else np.array([0, 1, 0])
+            axis2_candidate = d2 / np.linalg.norm(d2) if np.linalg.norm(d2) > 1e-6 else np.array([0, 1, 0])
+        
+        # Remove component along axis1 to ensure orthogonality
+        axis2 = axis2_candidate - np.dot(axis2_candidate, axis1) * axis1
+        if np.linalg.norm(axis2) > 1e-6:
+            axis2 = axis2 / np.linalg.norm(axis2)
+        else:
+            # Fallback: create perpendicular vector in the plane
+            axis2 = np.cross(ma_plane_norm, axis1)
+            if np.linalg.norm(axis2) > 1e-6:
+                axis2 = axis2 / np.linalg.norm(axis2)
+            else:
+                axis2 = np.array([0, 1, 0])
+        
+        # The third axis is perpendicular to the plane
+        axis3 = ma_plane_norm
         
         # Semi-axes lengths
         semi_axis1 = np.linalg.norm(ma_p2 - ellipse_center)
         semi_axis2 = np.linalg.norm(ma_p4 - ellipse_center)
         
-        # Assign MA region
-        perp_tolerance = 10.0
+        # Third axis length = 2 * (major_axis_length + minor_axis_length)
+        major_axis_length = 2 * semi_axis1
+        minor_axis_length = 2 * semi_axis2
+        semi_axis3 = (major_axis_length + minor_axis_length)/4.0
+        
+        # Add 2mm margin to all axes
+        margin = 2.0
+        semi_axis1 += margin
+        semi_axis2 += margin
+                
+        print(f"  MA ellipsoid parameters (with 1mm margin):")
+        print(f"    Center: ({ellipse_center[0]:.2f}, {ellipse_center[1]:.2f}, {ellipse_center[2]:.2f})")
+        print(f"    Semi-axis1 (major, in-plane): {semi_axis1:.2f} mm (full length: {2*semi_axis1:.2f} mm)")
+        print(f"    Semi-axis2 (minor, in-plane): {semi_axis2:.2f} mm (full length: {2*semi_axis2:.2f} mm)")
+        print(f"    Semi-axis3 (perpendicular): {semi_axis3:.2f} mm (full length: {2*semi_axis3:.2f} mm)")
+        
+        # Assign MA region using 3D ellipsoid equation
         for i, pt in enumerate(self.points):
             if regions[i] != 0:
                 continue
             v = pt - ellipse_center
-            perp_dist = abs(np.dot(v, ma_plane_norm))
-            v_in_plane = v - np.dot(v, ma_plane_norm) * ma_plane_norm
-            comp1 = np.dot(v_in_plane, axis1)
-            comp2 = np.dot(v_in_plane, axis2)
             
-            if semi_axis1 > 1e-6 and semi_axis2 > 1e-6:
-                ellipse_param = (comp1 / semi_axis1) ** 2 + (comp2 / semi_axis2) ** 2
-                if ellipse_param <= 1.0 and perp_dist <= perp_tolerance:
+            # Compute coordinates along the three axes
+            comp1 = np.dot(v, axis1)
+            comp2 = np.dot(v, axis2)
+            comp3 = np.dot(v, axis3)
+            
+            # Check 3D ellipsoid equation: (x/a)^2 + (y/b)^2 + (z/c)^2 <= 1
+            if semi_axis1 > 1e-6 and semi_axis2 > 1e-6 and semi_axis3 > 1e-6:
+                ellipsoid_param = (comp1 / semi_axis1) ** 2 + (comp2 / semi_axis2) ** 2 + (comp3 / semi_axis3) ** 2
+                if ellipsoid_param <= 1.0:
                     regions[i] = 5
-                elif ellipse_param <= 1.1 and perp_dist <= 5.0:
+                elif ellipsoid_param <= 1.05:  # Slight tolerance for boundary vertices
                     regions[i] = 5
         
         print(f"  MA: {np.sum(regions == 5)}")
         return ellipse_center
+    
     
     def create_pv_regions(self, regions, pv_name):
         """Create PV region and ostium ring for a single PV."""
