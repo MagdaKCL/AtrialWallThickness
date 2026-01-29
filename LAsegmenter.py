@@ -16,6 +16,7 @@ import heapq
 import pickle
 import os
 import time
+import csv
 
 class LASegmenter:
     def __init__(self, vtk_file):
@@ -83,13 +84,19 @@ class LASegmenter:
         self.faces = np.array(self.faces)
         print(f"✓ {len(self.points)} vertices, {len(self.faces)} faces")
         
-    def center_mesh(self):
-        center = np.mean(self.points, axis=0)
-        self.points -= center
+    def center_mesh(self, offset=None):
+        """Center the mesh. If offset is provided, use it instead of computing centroid.
+        Returns the centering offset used (for applying same transform to other meshes).
+        """
+        if offset is None:
+            offset = np.mean(self.points, axis=0)
+        self.centering_offset = offset.copy()
+        self.points -= offset
         vtk_points = vtk.vtkPoints()
         for p in self.points:
             vtk_points.InsertNextPoint(p)
         self.mesh.SetPoints(vtk_points)
+        return offset
         
     def build_graph(self):
         print("Building graph...")
@@ -1484,33 +1491,75 @@ class LASegmenter:
             # Fallback to ostium centers if ring vertices not available
             inf_bottom_plane_pt, inf_bottom_plane_normal = make_plane(ripv_ost_center, lipv_ost_center, heart_center)
         
-        # Inferior wall planes - use bottommost vertices of RIPV and LIPV ring boundaries
+        # Inferior wall side planes - use RIPV and LIPV ostia centers (symmetric with anterior)
+        # These planes go through ostia center → MA center → heart center
         inf_right_plane_pt = None
         inf_right_plane_normal = None
         inf_left_plane_pt = None
         inf_left_plane_normal = None
         
-        if ripv_bottom_vid is not None:
-            p1 = self.points[ripv_bottom_vid]
-            inf_right_plane_pt, inf_right_plane_normal = make_plane(p1, ellipse_center, heart_center)
+        ma_center = ellipse_center
         
-        if lipv_bottom_vid is not None:
-            p1 = self.points[lipv_bottom_vid]
-            inf_left_plane_pt, inf_left_plane_normal = make_plane(p1, ellipse_center, heart_center)
+        # Right inferior plane: through RIPV ostia center, MA center, and heart center
+        inf_right_plane_pt, inf_right_plane_normal = make_plane(ripv_ost_center, ma_center, heart_center)
+        # Normal should point toward the LEFT (inward, toward center of inferior region)
+        to_left = lipv_ost_center - ripv_ost_center
+        if np.dot(inf_right_plane_normal, to_left) < 0:
+            inf_right_plane_normal = -inf_right_plane_normal
         
-        # Roof anterior plane - use most anterior vertices of RSPV and LSPV ostium rings
-        rspv_ostium = np.where(regions == 13)[0]  # RSPV_Ostium (ostial opening boundary)
-        lspv_ostium = np.where(regions == 14)[0]  # LSPV_Ostium (ostial opening boundary)
+        # Left inferior plane: through LIPV ostia center, MA center, and heart center
+        inf_left_plane_pt, inf_left_plane_normal = make_plane(lipv_ost_center, ma_center, heart_center)
+        # Normal should point toward the RIGHT (inward, toward center of inferior region)
+        to_right = ripv_ost_center - lipv_ost_center
+        if np.dot(inf_left_plane_normal, to_right) < 0:
+            inf_left_plane_normal = -inf_left_plane_normal
+        
+        # Roof anterior plane - use most anterior vertices from the LOWER boundary of RSPV and LSPV ostium rings
+        # Ostium rings have 2 boundaries:
+        #   - Upper boundary: vertices adjacent to the PV (vein) region
+        #   - Lower boundary: vertices adjacent to other regions (not this ostium, not this vein)
+        # Only the lower boundary vertices should be candidates for the roof anterior plane
+        rspv_ostium = np.where(regions == 13)[0]  # RSPV_Ostium
+        lspv_ostium = np.where(regions == 14)[0]  # LSPV_Ostium
         rspv_anterior_vid = None
         lspv_anterior_vid = None
         
+        def get_lower_boundary_vertices(ostium_verts, ostium_rid, pv_rid):
+            """Get vertices on the lower boundary of an ostium ring.
+            Lower boundary = vertices with neighbors that are NOT this ostium and NOT the corresponding PV.
+            """
+            lower_boundary = []
+            ostium_set = set(ostium_verts)
+            for vid in ostium_verts:
+                for neighbor in self.graph.neighbors(vid):
+                    neighbor_region = regions[neighbor]
+                    # If neighbor is not the ostium itself AND not the PV, this is a lower boundary vertex
+                    if neighbor_region != ostium_rid and neighbor_region != pv_rid:
+                        lower_boundary.append(vid)
+                        break
+            return np.array(lower_boundary) if lower_boundary else None
+        
         if len(rspv_ostium) > 0:
-            ap_scores = np.dot(self.points[rspv_ostium] - ostia_centers['RSPV'], ap_axis)
-            rspv_anterior_vid = rspv_ostium[np.argmin(ap_scores)]
+            # Get lower boundary vertices (touching regions other than RSPV_Ostium=13 and RSPV=1)
+            rspv_lower = get_lower_boundary_vertices(rspv_ostium, 13, 1)
+            if rspv_lower is not None and len(rspv_lower) > 0:
+                ap_scores = np.dot(self.points[rspv_lower] - ostia_centers['RSPV'], ap_axis)
+                rspv_anterior_vid = rspv_lower[np.argmin(ap_scores)]
+            else:
+                # Fallback: use any ostium vertex with minimum AP score
+                ap_scores = np.dot(self.points[rspv_ostium] - ostia_centers['RSPV'], ap_axis)
+                rspv_anterior_vid = rspv_ostium[np.argmin(ap_scores)]
         
         if len(lspv_ostium) > 0:
-            ap_scores = np.dot(self.points[lspv_ostium] - ostia_centers['LSPV'], ap_axis)
-            lspv_anterior_vid = lspv_ostium[np.argmin(ap_scores)]
+            # Get lower boundary vertices (touching regions other than LSPV_Ostium=14 and LSPV=2)
+            lspv_lower = get_lower_boundary_vertices(lspv_ostium, 14, 2)
+            if lspv_lower is not None and len(lspv_lower) > 0:
+                ap_scores = np.dot(self.points[lspv_lower] - ostia_centers['LSPV'], ap_axis)
+                lspv_anterior_vid = lspv_lower[np.argmin(ap_scores)]
+            else:
+                # Fallback: use any ostium vertex with minimum AP score
+                ap_scores = np.dot(self.points[lspv_ostium] - ostia_centers['LSPV'], ap_axis)
+                lspv_anterior_vid = lspv_ostium[np.argmin(ap_scores)]
         
         roof_ant_plane_pt = None
         roof_ant_plane_normal = None
@@ -1518,8 +1567,10 @@ class LASegmenter:
             p1 = self.points[rspv_anterior_vid]
             p2 = self.points[lspv_anterior_vid]
             roof_ant_plane_pt, roof_ant_plane_normal = make_plane(p1, p2, heart_center)
-            to_pv = pv_quadrangle_center - p1
-            if np.dot(roof_ant_plane_normal, to_pv) > 0:
+            # Normal should point TOWARD MA/anterior (away from roof/PVs)
+            # Use MA center as reference - normal should point toward it
+            to_ma = ellipse_center - p1
+            if np.dot(roof_ant_plane_normal, to_ma) < 0:
                 roof_ant_plane_normal = -roof_ant_plane_normal
         
         ant_plane_right_pt = None
@@ -1528,19 +1579,24 @@ class LASegmenter:
         ant_plane_left_normal = None
         
         ma_center = ellipse_center
-        if rspv_anterior_vid is not None and lspv_anterior_vid is not None:
-            rspv_ant_pt = self.points[rspv_anterior_vid]
-            lspv_ant_pt = self.points[lspv_anterior_vid]
-            
-            ant_plane_right_pt, ant_plane_right_normal = make_plane(rspv_ant_pt, ma_center, heart_center)
-            to_pv = pv_quadrangle_center - rspv_ant_pt
-            if np.dot(ant_plane_right_normal, to_pv) > 0:
-                ant_plane_right_normal = -ant_plane_right_normal
-            
-            ant_plane_left_pt, ant_plane_left_normal = make_plane(lspv_ant_pt, ma_center, heart_center)
-            to_pv = pv_quadrangle_center - lspv_ant_pt
-            if np.dot(ant_plane_left_normal, to_pv) > 0:
-                ant_plane_left_normal = -ant_plane_left_normal
+        # Use ostia centers directly for more reliable plane positioning
+        # (instead of most anterior ostium vertex which can be mispositioned)
+        rspv_ost_center = ostia_centers['RSPV']
+        lspv_ost_center = ostia_centers['LSPV']
+        
+        # Right anterior plane: through RSPV ostia center, MA center, and heart center
+        ant_plane_right_pt, ant_plane_right_normal = make_plane(rspv_ost_center, ma_center, heart_center)
+        # Normal should point toward the LEFT (inward, toward center of anterior region)
+        to_left = lspv_ost_center - rspv_ost_center
+        if np.dot(ant_plane_right_normal, to_left) < 0:
+            ant_plane_right_normal = -ant_plane_right_normal
+        
+        # Left anterior plane: through LSPV ostia center, MA center, and heart center
+        ant_plane_left_pt, ant_plane_left_normal = make_plane(lspv_ost_center, ma_center, heart_center)
+        # Normal should point toward the RIGHT (inward, toward center of anterior region)
+        to_right = rspv_ost_center - lspv_ost_center
+        if np.dot(ant_plane_left_normal, to_right) < 0:
+            ant_plane_left_normal = -ant_plane_left_normal
         
         # Septal wall plane - parallel to SI axis, passing through MA center
         # Normal is perpendicular to SI axis (use LR axis as the plane normal)
@@ -1574,6 +1630,8 @@ class LASegmenter:
             'inf_left_plane_normal': inf_left_plane_normal,
             'roof_ant_plane_pt': roof_ant_plane_pt,
             'roof_ant_plane_normal': roof_ant_plane_normal,
+            'roof_ant_rspv_vid': rspv_anterior_vid,  # Debug: vertex ID used for roof_ant_plane (RSPV side)
+            'roof_ant_lspv_vid': lspv_anterior_vid,  # Debug: vertex ID used for roof_ant_plane (LSPV side)
             'ant_plane_right_pt': ant_plane_right_pt,
             'ant_plane_right_normal': ant_plane_right_normal,
             'ant_plane_left_pt': ant_plane_left_pt,
@@ -1614,11 +1672,21 @@ class LASegmenter:
     
     def create_inferior_wall(self, regions, geom):
         """Create inferior wall region (rid=9)."""
-        dist_inf_right = self.signed_distance_to_plane(self.points, geom['inf_right_plane_pt'], geom['inf_right_plane_normal'])
-        dist_inf_left = self.signed_distance_to_plane(self.points, geom['inf_left_plane_pt'], geom['inf_left_plane_normal'])
+        # Use post_bottom plane to separate inferior from posterior (symmetric with roof_ant for anterior)
+        dist_post_bottom = self.signed_distance_to_plane(self.points, geom['post_bottom_plane_pt'], geom['post_bottom_plane_normal'])
+        
+        dist_inf_right = np.zeros(len(self.points))
+        dist_inf_left = np.zeros(len(self.points))
+        if geom['inf_right_plane_pt'] is not None:
+            dist_inf_right = self.signed_distance_to_plane(self.points, geom['inf_right_plane_pt'], geom['inf_right_plane_normal'])
+        if geom['inf_left_plane_pt'] is not None:
+            dist_inf_left = self.signed_distance_to_plane(self.points, geom['inf_left_plane_pt'], geom['inf_left_plane_normal'])
         
         unassigned = regions == 0
-        inferior_mask = (unassigned & ((dist_inf_right > 0) & (dist_inf_left < 0)))
+        # Inferior wall is (symmetric with anterior):
+        # - Below post_bottom plane (dist_post_bottom < 0, since normal points toward PV center)
+        # - On the inward side of both left and right planes (dist > 0, since normals point inward)
+        inferior_mask = (unassigned & (dist_post_bottom < 0) & (dist_inf_right > 0) & (dist_inf_left > 0))
         regions[inferior_mask] = 9
         print(f"  Inferior: {np.sum(regions == 9)}")
     
@@ -1636,7 +1704,10 @@ class LASegmenter:
             dist_ant_left = self.signed_distance_to_plane(self.points, geom['ant_plane_left_pt'], geom['ant_plane_left_normal'])
         
         unassigned = regions == 0
-        anterior_mask = (unassigned & (dist_roof_ant > 0) & (dist_ant_right < 0) & (dist_ant_left > 0))
+        # Anterior wall is:
+        # - In front of roof_ant plane (dist_roof_ant > 0, since normal points toward MA/anterior)
+        # - On the inward side of both left and right planes (dist > 0, since normals point inward)
+        anterior_mask = (unassigned & (dist_roof_ant > 0) & (dist_ant_right > 0) & (dist_ant_left > 0))
 
         regions[anterior_mask] = 12
         print(f"  Anterior: {np.sum(regions == 12)}")
@@ -1684,7 +1755,7 @@ class LASegmenter:
         is_wall_single = (step == 'WALL_SINGLE')
         
         if is_final_review:
-            help_text = "SPACE=save, ESC=discard"
+            help_text = "SPACE=save & calculate thickness, ESC=discard"
             print(f"\n{help_text}")
         elif is_veins_review:
             help_text = "SPACE=continue, 's'=checkpoint"
@@ -1736,36 +1807,63 @@ class LASegmenter:
         
         renderer.AddActor(actor)
         
-        # Visualize roof anterior plane if walls review and geom available
+        # Debug visualization: show roof_ant_plane anchor points during wall review
         if is_walls_review and geom is not None:
-            if geom['roof_ant_plane_pt'] is not None and geom['roof_ant_plane_normal'] is not None:
-                # Create two orthogonal vectors in the plane for proper visualization
-                plane_pt = geom['roof_ant_plane_pt']
-                plane_normal = geom['roof_ant_plane_normal']
-                
-                # Create orthogonal basis vectors in the plane
-                if abs(plane_normal[2]) < 0.9:
-                    v1 = np.cross(plane_normal, np.array([0, 0, 1]))
-                else:
-                    v1 = np.cross(plane_normal, np.array([0, 1, 0]))
-                v1 = v1 / (np.linalg.norm(v1) + 1e-10)
-                v2 = np.cross(plane_normal, v1)
-                v2 = v2 / (np.linalg.norm(v2) + 1e-10)
-                
-                # Three points on the plane to define it
-                p1 = plane_pt
-                p2 = plane_pt + v1 * 30
-                p3 = plane_pt + v2 * 30
-                
-                roof_ant_actor, roof_ant_edges = self.create_posterior_wall_plane_actors(
-                    p1, p2, p3,
-                    plane_normal,
-                    (1, 1, 0),  # Yellow for roof anterior plane
-                    plane_size=30
-                )
-                renderer.AddActor(roof_ant_actor)
-                renderer.AddActor(roof_ant_edges)
-                print(f"✓ Roof anterior plane visualized (yellow) at {plane_pt}")
+            # Visualize the two points used for roof_ant_plane creation
+            rspv_vid = geom.get('roof_ant_rspv_vid')
+            lspv_vid = geom.get('roof_ant_lspv_vid')
+            
+            if rspv_vid is not None:
+                sphere = vtk.vtkSphereSource()
+                sphere.SetCenter(*self.points[rspv_vid])
+                sphere.SetRadius(2.0)
+                sphere.SetPhiResolution(16)
+                sphere.SetThetaResolution(16)
+                sm = vtk.vtkPolyDataMapper()
+                sm.SetInputConnection(sphere.GetOutputPort())
+                sa = vtk.vtkActor()
+                sa.SetMapper(sm)
+                sa.GetProperty().SetColor(1, 0, 0)  # Red for RSPV side
+                renderer.AddActor(sa)
+                print(f"  DEBUG: RSPV roof_ant point vid={rspv_vid} at {self.points[rspv_vid]}")
+            
+            if lspv_vid is not None:
+                sphere = vtk.vtkSphereSource()
+                sphere.SetCenter(*self.points[lspv_vid])
+                sphere.SetRadius(2.0)
+                sphere.SetPhiResolution(16)
+                sphere.SetThetaResolution(16)
+                sm = vtk.vtkPolyDataMapper()
+                sm.SetInputConnection(sphere.GetOutputPort())
+                sa = vtk.vtkActor()
+                sa.SetMapper(sm)
+                sa.GetProperty().SetColor(0, 0, 1)  # Blue for LSPV side
+                renderer.AddActor(sa)
+                print(f"  DEBUG: LSPV roof_ant point vid={lspv_vid} at {self.points[lspv_vid]}")
+            
+            # Also draw a line between them to show the roof_ant_plane edge
+            if rspv_vid is not None and lspv_vid is not None:
+                line_pts = vtk.vtkPoints()
+                line_pts.InsertNextPoint(self.points[rspv_vid])
+                line_pts.InsertNextPoint(self.points[lspv_vid])
+                line = vtk.vtkLine()
+                line.GetPointIds().SetId(0, 0)
+                line.GetPointIds().SetId(1, 1)
+                lines = vtk.vtkCellArray()
+                lines.InsertNextCell(line)
+                line_pd = vtk.vtkPolyData()
+                line_pd.SetPoints(line_pts)
+                line_pd.SetLines(lines)
+                tube = vtk.vtkTubeFilter()
+                tube.SetInputData(line_pd)
+                tube.SetRadius(0.5)
+                tube.SetNumberOfSides(8)
+                lm = vtk.vtkPolyDataMapper()
+                lm.SetInputConnection(tube.GetOutputPort())
+                la = vtk.vtkActor()
+                la.SetMapper(lm)
+                la.GetProperty().SetColor(1, 1, 0)  # Yellow line
+                renderer.AddActor(la)
         
         # Add text display for title and keybindings
         text_actor = vtk.vtkTextActor()
@@ -2028,6 +2126,9 @@ class LASegmenter:
             self.faces = segmenter.faces
             self.graph = segmenter.graph
             self.markers = segmenter.markers
+            # Copy centering offset (critical for aligning exterior mesh later)
+            if hasattr(segmenter, 'centering_offset'):
+                self.centering_offset = segmenter.centering_offset
             regions = np.zeros(len(self.points), dtype=int)
             
             # Recreate all regions from saved markers
@@ -2172,32 +2273,30 @@ class LASegmenter:
         
         if action == 'window_closed':
             print("\n✗ Program terminated by user.")
-            return None
+            return None, None
         elif action == 'discard' or action == 'quit':
             print("\n✗ Not saved")
-            return None
+            return None, None
         else:
-            # Space was pressed on final review, treat as save
-            self.save_results(regions, self.vtk_file.replace('.vtk', ''))
-            print("\n✓ DONE!")
-            return regions
+            # SPACE was pressed - save and run both thickness algorithms
+            print("\n✓ Segmentation complete! Will run BOTH thickness algorithms.")
+            return regions, 'both'
 
 
 
 
 
-def calculate_wall_thickness(interior_segmenter, exterior_mesh, regions):
+def calculate_wall_thickness(interior_segmenter, exterior_mesh, regions, 
+                             max_thickness_mm=10.0, min_thickness_mm=0.1,
+                             outlier_std_threshold=3.0, normal_dot_threshold=0.0):
     """
-    Calculate average wall thickness for each region using KDTree nearest point search.
+    Calculate average wall thickness for each region using hybrid KDTree approach.
     
-    This is 100-1000x faster than ray-casting because it uses spatial indexing
-    instead of testing every ray against every triangle.
-    
-    For each vertex in the interior mesh:
-    1. Find the nearest point on the exterior surface
-    2. Check if the vertex normal points toward the exterior (quality metric)
-    3. Calculate thickness as distance to that point
-    4. Average results per region (only counting valid normals)
+    Hybrid approach:
+    1. Use KDTree for fast nearest-point queries
+    2. Validate measurements using normal alignment
+    3. Apply minimum/maximum anatomical thickness filters
+    4. Remove statistical outliers per region
     
     Parameters:
     -----------
@@ -2207,12 +2306,21 @@ def calculate_wall_thickness(interior_segmenter, exterior_mesh, regions):
         The exterior (epicardium) mesh
     regions : np.ndarray
         The region assignments computed during segmentation
+    max_thickness_mm : float
+        Maximum plausible wall thickness (default 10mm for atrial wall)
+    min_thickness_mm : float
+        Minimum plausible wall thickness (default 0.1mm - filters mesh overlap)
+    outlier_std_threshold : float
+        Number of standard deviations for outlier detection (default 3.0)
+    normal_dot_threshold : float
+        Minimum dot product between normal and to-exterior direction (default 0.0)
+        Lower values accept more measurements; 0.0 accepts any angle < 90°
     """
     from scipy.spatial import KDTree
     import csv
     
     print("\n" + "="*60)
-    print("  CALCULATING WALL THICKNESS")
+    print("  CALCULATING WALL THICKNESS (Hybrid Approach)")
     print("="*60 + "\n")
     
     interior_mesh = interior_segmenter.mesh
@@ -2224,6 +2332,42 @@ def calculate_wall_thickness(interior_segmenter, exterior_mesh, regions):
     
     print(f"Exterior surface: {len(exterior_points)} vertices")
     print(f"Interior mesh: {len(interior_points)} vertices")
+    
+    # === ALIGNMENT CHECK ===
+    print("\nChecking mesh alignment...")
+    interior_centroid = np.mean(interior_points, axis=0)
+    exterior_centroid = np.mean(exterior_points, axis=0)
+    centroid_offset = np.linalg.norm(exterior_centroid - interior_centroid)
+    
+    print(f"  Interior centroid: ({interior_centroid[0]:.2f}, {interior_centroid[1]:.2f}, {interior_centroid[2]:.2f})")
+    print(f"  Exterior centroid: ({exterior_centroid[0]:.2f}, {exterior_centroid[1]:.2f}, {exterior_centroid[2]:.2f})")
+    print(f"  Centroid offset: {centroid_offset:.2f} mm")
+    
+    # Warn if centroids are far apart (suggesting misalignment)
+    if centroid_offset > 5.0:
+        print(f"  ⚠ WARNING: Mesh centroids differ by {centroid_offset:.2f}mm!")
+        print(f"    This may indicate meshes are not aligned.")
+        print(f"    Expected offset for concentric surfaces: < 5mm")
+    else:
+        print(f"  ✓ Mesh alignment appears OK (offset < 5mm)")
+    
+    print(f"\nFiltering parameters:")
+    print(f"  Min thickness: {min_thickness_mm} mm (filters mesh overlap/touching)")
+    print(f"  Max thickness: {max_thickness_mm} mm (filters cross-chamber measurements)")
+    print(f"  Normal dot threshold: {normal_dot_threshold} (0=accept <90°, 0.5=accept <60°)")
+    print(f"  Outlier threshold: {outlier_std_threshold} standard deviations")
+    
+    # Define which regions are "true walls" vs "anatomical structures"
+    wall_regions = {7, 8, 9, 10, 11, 12}  # Posterior, Roof, Inferior, Lateral, Septal, Anterior
+    pv_regions = {1, 2, 3, 4}  # RSPV, LSPV, RIPV, LIPV
+    ostium_regions = {13, 14, 15, 16}  # PV ostia
+    other_regions = {5, 6}  # MA, LAA
+    
+    print(f"\nRegion categories:")
+    print(f"  Wall regions (7-12): Primary targets for thickness measurement")
+    print(f"  PV regions (1-4): Tubular structures - may have unreliable measurements")
+    print(f"  Ostium regions (13-16): Transition zones")
+    print(f"  Other (5-6): MA, LAA - special structures")
     
     # Generate output filename
     base_path = interior_segmenter.vtk_file.replace('.vtk', '').replace('.wrk', '')
@@ -2243,12 +2387,17 @@ def calculate_wall_thickness(interior_segmenter, exterior_mesh, regions):
     t2 = time.time()
     print(f"  Normal computation time: {(t2-t1):.2f}s")
     
-    # Dictionary to store thickness measurements and disregarded counts per region
+    # Dictionary to store thickness measurements and detailed discard tracking per region
     thickness_by_region = {}
-    disregarded_by_region = {}
+    discard_reasons = {}  # Track WHY vertices were discarded
     for region_id in range(17):
         thickness_by_region[region_id] = []
-        disregarded_by_region[region_id] = 0
+        discard_reasons[region_id] = {
+            'too_close': 0,      # distance < min_thickness (mesh overlap)
+            'too_far': 0,        # distance > max_thickness (cross-chamber)
+            'bad_normal': 0,     # normal doesn't point toward exterior
+            'outlier': 0,        # statistical outlier
+        }
     
     # Query nearest points for all interior vertices at once
     print("\nQuerying nearest exterior points...")
@@ -2302,7 +2451,7 @@ def calculate_wall_thickness(interior_segmenter, exterior_mesh, regions):
         # Determine if normals point outward or inward
         if median_dot < 0:
             print(f"  ⚠ Normals appear to point INWARD (median dot product: {median_dot:.4f})")
-            print(f"  → Using abs(dot_product) >= 0.1 to accept both directions")
+            print(f"  → Will use abs(dot_product) for validation")
             use_abs_dot = True
         else:
             print(f"  ✓ Normals appear to point OUTWARD (median dot product: {median_dot:.4f})")
@@ -2310,11 +2459,24 @@ def calculate_wall_thickness(interior_segmenter, exterior_mesh, regions):
     else:
         use_abs_dot = False
     
-    # Now process all vertices
+    # Now process all vertices with filtering
     print(f"\n  Processing all vertices...")
+    
     for i in range(len(interior_points)):
         region_id = interior_regions[i]
         if region_id <= 0:
+            continue
+        
+        distance = distances[i]
+        
+        # === MIN THICKNESS FILTER (mesh overlap/touching) ===
+        if distance < min_thickness_mm:
+            discard_reasons[region_id]['too_close'] += 1
+            continue
+        
+        # === MAX THICKNESS FILTER (cross-chamber measurements) ===
+        if distance > max_thickness_mm:
+            discard_reasons[region_id]['too_far'] += 1
             continue
         
         # Vector from interior to nearest exterior point
@@ -2323,42 +2485,78 @@ def calculate_wall_thickness(interior_segmenter, exterior_mesh, regions):
         to_exterior_norm = np.linalg.norm(to_exterior)
         
         if to_exterior_norm < 1e-6:
-            # Vertex is essentially at exterior point, disregard
-            disregarded_by_region[region_id] += 1
+            discard_reasons[region_id]['too_close'] += 1
             continue
         
         to_exterior_normalized = to_exterior / to_exterior_norm
         vertex_normal = normals[i]
         
         # Check if normal aligns with exterior direction
-        # Use absolute value if normals point inward
         dot_product = np.dot(vertex_normal, to_exterior_normalized)
         
         if use_abs_dot:
             # Accept if normal has significant component in either direction
-            if abs(dot_product) >= 0.1:
-                thickness_by_region[region_id].append(distances[i])
+            if abs(dot_product) >= normal_dot_threshold:
+                thickness_by_region[region_id].append(distance)
             else:
-                disregarded_by_region[region_id] += 1
+                discard_reasons[region_id]['bad_normal'] += 1
         else:
             # Only accept if normal points toward exterior
-            if dot_product > 0.1:
-                thickness_by_region[region_id].append(distances[i])
+            if dot_product >= normal_dot_threshold:
+                thickness_by_region[region_id].append(distance)
             else:
-                disregarded_by_region[region_id] += 1
+                discard_reasons[region_id]['bad_normal'] += 1
     
     t2 = time.time()
-    print(f"  Normal validation time: {(t2-t1):.2f}s")
+    print(f"  Processing time: {(t2-t1):.2f}s")
     
-    # Group results by region
-    print("\nGrouping results by region...")
+    # Report discard statistics
+    print(f"\n  Discard statistics by reason:")
+    total_too_close = sum(d['too_close'] for d in discard_reasons.values())
+    total_too_far = sum(d['too_far'] for d in discard_reasons.values())
+    total_bad_normal = sum(d['bad_normal'] for d in discard_reasons.values())
+    print(f"    Too close (<{min_thickness_mm}mm): {total_too_close}")
+    print(f"    Too far (>{max_thickness_mm}mm): {total_too_far}")
+    print(f"    Bad normal alignment: {total_bad_normal}")
     
-    # Print results to console
-    print("\nWALL THICKNESS RESULTS:")
-    print("-" * 100)
-    print(f"{'Region':<8} {'Name':<25} {'Avg Thickness (mm)':<20} {'Std Dev':<15} {'Valid':<10} {'Disregarded':<15}")
-    print("-" * 100)
+    # === OUTLIER DETECTION PER REGION ===
+    print(f"\nApplying outlier detection (>{outlier_std_threshold}σ)...")
+    outliers_removed = 0
     
+    for region_id in range(1, 17):
+        if len(thickness_by_region[region_id]) < 10:
+            continue  # Not enough data for meaningful statistics
+        
+        thicknesses = np.array(thickness_by_region[region_id])
+        mean_t = np.mean(thicknesses)
+        std_t = np.std(thicknesses)
+        
+        if std_t < 1e-6:
+            continue  # All values are essentially the same
+        
+        # Find outliers
+        lower_bound = mean_t - outlier_std_threshold * std_t
+        upper_bound = mean_t + outlier_std_threshold * std_t
+        
+        # Filter to keep only non-outliers
+        filtered = thicknesses[(thicknesses >= lower_bound) & (thicknesses <= upper_bound)]
+        removed = len(thicknesses) - len(filtered)
+        
+        if removed > 0:
+            outliers_removed += removed
+            thickness_by_region[region_id] = filtered.tolist()
+            discard_reasons[region_id]['outlier'] += removed
+    
+    if outliers_removed > 0:
+        print(f"  Removed {outliers_removed} statistical outliers across all regions")
+    else:
+        print(f"  No statistical outliers detected")
+    
+    # Calculate total discards per region for reporting
+    def total_discards(region_id):
+        return sum(discard_reasons[region_id].values())
+    
+    # Print results to console - separate wall regions from other structures
     region_names = [
         'Background', 'RSPV', 'LSPV', 'RIPV', 'LIPV', 'MA', 'LAA',
         'Posterior', 'Roof', 'Inferior', 'Lateral',
@@ -2370,52 +2568,702 @@ def calculate_wall_thickness(interior_segmenter, exterior_mesh, regions):
     csv_filename = base_path + '_wall_thickness.csv'
     results_data = []
     
-    for region_id in range(1, 17):
+    # Print WALL REGIONS first (primary results)
+    print("\n" + "="*120)
+    print("  WALL THICKNESS RESULTS - PRIMARY WALL REGIONS")
+    print("="*120)
+    print(f"{'Region':<8} {'Name':<18} {'Avg (mm)':<12} {'Std Dev':<12} {'Valid':<10} {'TooClose':<10} {'TooFar':<10} {'BadNorm':<10} {'Outlier':<10}")
+    print("-" * 120)
+    
+    for region_id in [7, 8, 9, 10, 11, 12]:  # Wall regions
         if region_id in thickness_by_region and len(thickness_by_region[region_id]) > 0:
             thicknesses = thickness_by_region[region_id]
             avg_thickness = np.mean(thicknesses)
             std_thickness = np.std(thicknesses)
             num_valid = len(thicknesses)
-            num_disregarded = disregarded_by_region[region_id]
-            name = region_names[region_id] if region_id < len(region_names) else f"Region{region_id}"
+            name = region_names[region_id]
+            dr = discard_reasons[region_id]
             
-            # Print to console
-            print(f"{region_id:<8} {name:<25} {avg_thickness:<20.3f} {std_thickness:<15.3f} {num_valid:<10} {num_disregarded:<15}")
+            print(f"{region_id:<8} {name:<18} {avg_thickness:<12.3f} {std_thickness:<12.3f} {num_valid:<10} {dr['too_close']:<10} {dr['too_far']:<10} {dr['bad_normal']:<10} {dr['outlier']:<10}")
             
-            # Store for CSV
             results_data.append({
                 'Region_ID': region_id,
                 'Region_Name': name,
+                'Category': 'Wall',
                 'Avg_Thickness_mm': round(avg_thickness, 4),
                 'Std_Dev_mm': round(std_thickness, 4),
                 'Valid_Vertices': num_valid,
-                'Disregarded_Vertices': num_disregarded,
-                'Total_Vertices': num_valid + num_disregarded
+                'Discard_TooClose': dr['too_close'],
+                'Discard_TooFar': dr['too_far'],
+                'Discard_BadNormal': dr['bad_normal'],
+                'Discard_Outlier': dr['outlier'],
+                'Total_Vertices': num_valid + total_discards(region_id)
             })
-        elif disregarded_by_region[region_id] > 0:
-            # Region has only disregarded vertices
-            name = region_names[region_id] if region_id < len(region_names) else f"Region{region_id}"
-            print(f"{region_id:<8} {name:<25} {'N/A':<20} {'N/A':<15} {0:<10} {disregarded_by_region[region_id]:<15}")
+    
+    print("-" * 120)
+    
+    # Print OSTIUM REGIONS
+    print("\n  OSTIUM REGIONS (Transition Zones)")
+    print("-" * 120)
+    print(f"{'Region':<8} {'Name':<18} {'Avg (mm)':<12} {'Std Dev':<12} {'Valid':<10} {'TooClose':<10} {'TooFar':<10} {'BadNorm':<10} {'Outlier':<10}")
+    print("-" * 120)
+    
+    for region_id in [13, 14, 15, 16]:  # Ostium regions
+        if region_id in thickness_by_region and len(thickness_by_region[region_id]) > 0:
+            thicknesses = thickness_by_region[region_id]
+            avg_thickness = np.mean(thicknesses)
+            std_thickness = np.std(thicknesses)
+            num_valid = len(thicknesses)
+            name = region_names[region_id]
+            dr = discard_reasons[region_id]
+            
+            print(f"{region_id:<8} {name:<18} {avg_thickness:<12.3f} {std_thickness:<12.3f} {num_valid:<10} {dr['too_close']:<10} {dr['too_far']:<10} {dr['bad_normal']:<10} {dr['outlier']:<10}")
             
             results_data.append({
                 'Region_ID': region_id,
                 'Region_Name': name,
-                'Avg_Thickness_mm': 'N/A',
-                'Std_Dev_mm': 'N/A',
-                'Valid_Vertices': 0,
-                'Disregarded_Vertices': disregarded_by_region[region_id],
-                'Total_Vertices': disregarded_by_region[region_id]
+                'Category': 'Ostium',
+                'Avg_Thickness_mm': round(avg_thickness, 4),
+                'Std_Dev_mm': round(std_thickness, 4),
+                'Valid_Vertices': num_valid,
+                'Discard_TooClose': dr['too_close'],
+                'Discard_TooFar': dr['too_far'],
+                'Discard_BadNormal': dr['bad_normal'],
+                'Discard_Outlier': dr['outlier'],
+                'Total_Vertices': num_valid + total_discards(region_id)
             })
     
-    print("-" * 100)
+    print("-" * 120)
+    
+    # Print PV and OTHER REGIONS (less reliable measurements)
+    print("\n  PV & SPECIAL STRUCTURES (⚠ measurements may be unreliable)")
+    print("-" * 120)
+    print(f"{'Region':<8} {'Name':<18} {'Avg (mm)':<12} {'Std Dev':<12} {'Valid':<10} {'TooClose':<10} {'TooFar':<10} {'BadNorm':<10} {'Outlier':<10}")
+    print("-" * 120)
+    
+    for region_id in [1, 2, 3, 4, 5, 6]:  # PV and other regions
+        if region_id in thickness_by_region:
+            thicknesses = thickness_by_region[region_id]
+            name = region_names[region_id]
+            dr = discard_reasons[region_id]
+            
+            if len(thicknesses) > 0:
+                avg_thickness = np.mean(thicknesses)
+                std_thickness = np.std(thicknesses)
+                num_valid = len(thicknesses)
+                print(f"{region_id:<8} {name:<18} {avg_thickness:<12.3f} {std_thickness:<12.3f} {num_valid:<10} {dr['too_close']:<10} {dr['too_far']:<10} {dr['bad_normal']:<10} {dr['outlier']:<10}")
+                
+                results_data.append({
+                    'Region_ID': region_id,
+                    'Region_Name': name,
+                    'Category': 'PV/Special',
+                    'Avg_Thickness_mm': round(avg_thickness, 4),
+                    'Std_Dev_mm': round(std_thickness, 4),
+                    'Valid_Vertices': num_valid,
+                    'Discard_TooClose': dr['too_close'],
+                    'Discard_TooFar': dr['too_far'],
+                    'Discard_BadNormal': dr['bad_normal'],
+                    'Discard_Outlier': dr['outlier'],
+                    'Total_Vertices': num_valid + total_discards(region_id)
+                })
+            elif total_discards(region_id) > 0:
+                print(f"{region_id:<8} {name:<18} {'N/A':<12} {'N/A':<12} {0:<10} {dr['too_close']:<10} {dr['too_far']:<10} {dr['bad_normal']:<10} {dr['outlier']:<10}")
+                
+                results_data.append({
+                    'Region_ID': region_id,
+                    'Region_Name': name,
+                    'Category': 'PV/Special',
+                    'Avg_Thickness_mm': 'N/A',
+                    'Std_Dev_mm': 'N/A',
+                    'Valid_Vertices': 0,
+                    'Discard_TooClose': dr['too_close'],
+                    'Discard_TooFar': dr['too_far'],
+                    'Discard_BadNormal': dr['bad_normal'],
+                    'Discard_Outlier': dr['outlier'],
+                    'Total_Vertices': total_discards(region_id)
+                })
+    
+    print("-" * 120)
     
     # Write results to CSV
     if results_data:
         print(f"\nSaving results to CSV: {csv_filename}")
         try:
             with open(csv_filename, 'w', newline='') as csvfile:
-                fieldnames = ['Region_ID', 'Region_Name', 'Avg_Thickness_mm', 'Std_Dev_mm', 
-                             'Valid_Vertices', 'Disregarded_Vertices', 'Total_Vertices']
+                fieldnames = ['Region_ID', 'Region_Name', 'Category', 'Avg_Thickness_mm', 'Std_Dev_mm', 
+                             'Valid_Vertices', 'Discard_TooClose', 'Discard_TooFar', 
+                             'Discard_BadNormal', 'Discard_Outlier', 'Total_Vertices']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(results_data)
+            print(f"✓ Results saved to {csv_filename}")
+        except Exception as e:
+            print(f"✗ Failed to save CSV: {e}")
+
+
+def calculate_wall_thickness_full(interior_segmenter, exterior_mesh, regions,
+                                   max_thickness_mm=10.0, min_thickness_mm=0.1,
+                                   outlier_std_threshold=3.0):
+    """
+    Calculate wall thickness using ray casting along vertex normals (SLOW but ACCURATE).
+    
+    This method casts a ray from each interior vertex along its normal direction
+    and finds the intersection with the exterior mesh. This provides true wall
+    thickness measurements rather than nearest-point approximations.
+    
+    Parameters:
+    -----------
+    interior_segmenter : LASegmenter
+        The segmented interior mesh object
+    exterior_mesh : vtkPolyData
+        The exterior (epicardium) mesh
+    regions : np.ndarray
+        The region assignments computed during segmentation
+    max_thickness_mm : float
+        Maximum plausible wall thickness (default 10mm)
+    min_thickness_mm : float
+        Minimum plausible wall thickness (default 0.1mm)
+    outlier_std_threshold : float
+        Number of standard deviations for outlier detection (default 3.0)
+    """
+    print("\n" + "="*60)
+    print("  CALCULATING WALL THICKNESS (Ray Casting - ACCURATE)")
+    print("="*60 + "\n")
+    
+    print("⚠ This method is slower but more accurate than the fast method.")
+    print("  It casts rays along vertex normals to find true wall thickness.\n")
+    
+    interior_mesh = interior_segmenter.mesh
+    interior_points = interior_segmenter.points
+    interior_regions = regions
+    
+    # Extract exterior mesh data
+    exterior_points = vtk_to_numpy(exterior_mesh.GetPoints().GetData())
+    
+    print(f"Exterior surface: {len(exterior_points)} vertices")
+    print(f"Interior mesh: {len(interior_points)} vertices")
+    
+    # === ALIGNMENT CHECK ===
+    print("\nChecking mesh alignment...")
+    interior_centroid = np.mean(interior_points, axis=0)
+    exterior_centroid = np.mean(exterior_points, axis=0)
+    centroid_offset = np.linalg.norm(exterior_centroid - interior_centroid)
+    
+    print(f"  Interior centroid: ({interior_centroid[0]:.2f}, {interior_centroid[1]:.2f}, {interior_centroid[2]:.2f})")
+    print(f"  Exterior centroid: ({exterior_centroid[0]:.2f}, {exterior_centroid[1]:.2f}, {exterior_centroid[2]:.2f})")
+    print(f"  Centroid offset: {centroid_offset:.2f} mm")
+    
+    if centroid_offset > 5.0:
+        print(f"  ⚠ WARNING: Mesh centroids differ by {centroid_offset:.2f}mm!")
+        print(f"    This may indicate meshes are not aligned.")
+    else:
+        print(f"  ✓ Mesh alignment appears OK (offset < 5mm)")
+    
+    print(f"\nFiltering parameters:")
+    print(f"  Min thickness: {min_thickness_mm} mm")
+    print(f"  Max thickness: {max_thickness_mm} mm")
+    print(f"  Outlier threshold: {outlier_std_threshold} standard deviations")
+    
+    # Generate output filename
+    base_path = interior_segmenter.vtk_file.replace('.vtk', '').replace('.wrk', '')
+    
+    # Compute normals for interior mesh vertices
+    print("\nComputing interior vertex normals...")
+    t1 = time.time()
+    interior_segmenter.compute_all_vertex_normals()
+    normals = interior_segmenter.vertex_normals
+    t2 = time.time()
+    print(f"  Normal computation time: {(t2-t1):.2f}s")
+    
+    # Build OBBTree for ray casting on exterior mesh
+    print("\nBuilding OBBTree for ray casting...")
+    t1 = time.time()
+    obb_tree = vtk.vtkOBBTree()
+    obb_tree.SetDataSet(exterior_mesh)
+    obb_tree.BuildLocator()
+    t2 = time.time()
+    print(f"  OBBTree build time: {(t2-t1):.2f}s")
+    
+    # Determine normal direction (inward vs outward)
+    print("\nDetermining normal direction...")
+    print("=" * 60)
+    
+    # First, verify mesh relationship by checking actual surface-to-surface distance
+    print("\n1. MESH DISTANCE VERIFICATION:")
+    from scipy.spatial import KDTree
+    kdtree_check = KDTree(exterior_points)
+    sample_distances = []
+    sample_indices = np.random.choice(len(interior_points), min(1000, len(interior_points)), replace=False)
+    
+    for idx in sample_indices:
+        if interior_regions[idx] <= 0:
+            continue
+        dist, _ = kdtree_check.query(interior_points[idx])
+        sample_distances.append(dist)
+    
+    if sample_distances:
+        min_dist = np.min(sample_distances)
+        max_dist = np.max(sample_distances)
+        mean_dist = np.mean(sample_distances)
+        median_dist = np.median(sample_distances)
+        
+        print(f"  Sample surface-to-surface distances (n={len(sample_distances)}):")
+        print(f"    Min:    {min_dist:.3f} mm")
+        print(f"    Max:    {max_dist:.3f} mm")
+        print(f"    Mean:   {mean_dist:.3f} mm")
+        print(f"    Median: {median_dist:.3f} mm")
+        
+        if max_dist > max_thickness_mm:
+            print(f"  ⚠ WARNING: Max distance ({max_dist:.1f}mm) exceeds ray length ({max_thickness_mm}mm)!")
+            print(f"    Rays may be too short to reach exterior mesh.")
+        
+        if min_dist < 0.5:
+            print(f"  ⚠ WARNING: Min distance ({min_dist:.3f}mm) is very small!")
+            print(f"    Meshes may be overlapping or very close.")
+    
+    # Method 1: Geometric heuristic - exterior should be in direction of normals
+    # Sample vertices and check if normal points toward exterior centroid
+    print("\n2. GEOMETRIC TEST (normal vs exterior centroid):")
+    geometric_vote_outward = 0
+    geometric_vote_inward = 0
+    
+    sample_size = min(1000, len(interior_points))
+    sampled_indices = np.random.choice(len(interior_points), sample_size, replace=False)
+    
+    for i in sampled_indices:
+        region_id = interior_regions[i]
+        if region_id <= 0:
+            continue
+        
+        pt = interior_points[i]
+        normal = normals[i]
+        
+        # Vector from this point to exterior centroid
+        to_exterior_centroid = exterior_centroid - pt
+        
+        # Check if normal points toward exterior centroid
+        dot = np.dot(normal, to_exterior_centroid)
+        
+        if dot > 0:
+            geometric_vote_outward += 1
+        else:
+            geometric_vote_inward += 1
+    
+    print(f"    Normals pointing toward exterior centroid: {geometric_vote_outward}")
+    print(f"    Normals pointing away from exterior:      {geometric_vote_inward}")
+    
+    # Method 2: Check if normal points away from interior centroid
+    print("\n3. INTERIOR CENTROID TEST (normal vs interior centroid):")
+    interior_test_outward = 0
+    interior_test_inward = 0
+    
+    for i in sampled_indices:
+        region_id = interior_regions[i]
+        if region_id <= 0:
+            continue
+        
+        pt = interior_points[i]
+        normal = normals[i]
+        
+        # Vector from interior centroid to this point (should align with outward normal)
+        from_interior_centroid = pt - interior_centroid
+        from_interior_centroid_norm = from_interior_centroid / (np.linalg.norm(from_interior_centroid) + 1e-10)
+        
+        dot = np.dot(normal, from_interior_centroid_norm)
+        
+        if dot > 0:
+            interior_test_outward += 1
+        else:
+            interior_test_inward += 1
+    
+    print(f"    Normals pointing away from interior center: {interior_test_outward}")
+    print(f"    Normals pointing toward interior center:   {interior_test_inward}")
+    
+    # Method 3: Ray casting test - which direction gets more hits
+    print("\n4. RAY CASTING TEST (actual intersection test):")
+    sample_count = 0
+    outward_count = 0
+    inward_count = 0
+    outward_distances = []
+    inward_distances = []
+    
+    test_ray_length = max(30.0, max_thickness_mm * 2)  # Use longer rays for testing
+    
+    for i in sampled_indices[:500]:  # Test with 500 rays
+        region_id = interior_regions[i]
+        if region_id <= 0:
+            continue
+        
+        pt = interior_points[i]
+        normal = normals[i]
+        
+        # Test ray in NORMAL direction (outward if normals point out)
+        ray_start_out = pt + normal * 0.01
+        ray_end_outward = pt + normal * test_ray_length
+        
+        # Test ray in OPPOSITE direction (outward if normals point in)
+        ray_start_in = pt - normal * 0.01
+        ray_end_inward = pt - normal * test_ray_length
+        
+        # Check intersection in both directions
+        points_outward = vtk.vtkPoints()
+        points_inward = vtk.vtkPoints()
+        
+        hit_outward = obb_tree.IntersectWithLine(ray_start_out, ray_end_outward, points_outward, None)
+        hit_inward = obb_tree.IntersectWithLine(ray_start_in, ray_end_inward, points_inward, None)
+        
+        if hit_outward and points_outward.GetNumberOfPoints() > 0:
+            outward_count += 1
+            # Get first intersection distance
+            first_pt = np.array(points_outward.GetPoint(0))
+            dist = np.linalg.norm(first_pt - pt)
+            outward_distances.append(dist)
+            
+        if hit_inward and points_inward.GetNumberOfPoints() > 0:
+            inward_count += 1
+            first_pt = np.array(points_inward.GetPoint(0))
+            dist = np.linalg.norm(first_pt - pt)
+            inward_distances.append(dist)
+        
+        sample_count += 1
+    
+    print(f"    Rays in NORMAL direction:   {outward_count} hits")
+    if outward_distances:
+        print(f"      Hit distances: min={np.min(outward_distances):.2f}, max={np.max(outward_distances):.2f}, mean={np.mean(outward_distances):.2f} mm")
+    print(f"    Rays in OPPOSITE direction: {inward_count} hits")
+    if inward_distances:
+        print(f"      Hit distances: min={np.min(inward_distances):.2f}, max={np.max(inward_distances):.2f}, mean={np.mean(inward_distances):.2f} mm")
+    
+    # Decision logic
+    print("\n5. DECISION:")
+    print("=" * 60)
+    
+    # Strong preference for ray casting test since it's most direct
+    if outward_count > inward_count * 2:
+        print(f"  → RAY TEST is decisive: Normals point OUTWARD")
+        print(f"     Using normal direction AS-IS")
+        normal_sign = 1.0
+    elif inward_count > outward_count * 2:
+        print(f"  → RAY TEST is decisive: Normals point INWARD")
+        print(f"     Will NEGATE normals for ray casting")
+        normal_sign = -1.0
+    elif outward_count > inward_count:
+        print(f"  → RAY TEST favors OUTWARD (but not decisive)")
+        print(f"     Using normal direction AS-IS")
+        normal_sign = 1.0
+    elif inward_count > outward_count:
+        print(f"  → RAY TEST favors INWARD (but not decisive)")
+        print(f"     Will NEGATE normals for ray casting")
+        normal_sign = -1.0
+    else:
+        print(f"  ⚠ RAY TEST is INCONCLUSIVE!")
+        # Fall back to geometric tests
+        if interior_test_outward > interior_test_inward:
+            print(f"     Falling back to INTERIOR CENTROID test: Using normals AS-IS")
+            normal_sign = 1.0
+        else:
+            print(f"     Falling back to INTERIOR CENTROID test: Will NEGATE normals")
+            normal_sign = -1.0
+    
+    print("=" * 60)
+    
+    # Dictionary to store thickness measurements
+    thickness_by_region = {}
+    discard_reasons = {}
+    for region_id in range(17):
+        thickness_by_region[region_id] = []
+        discard_reasons[region_id] = {
+            'too_close': 0,
+            'too_far': 0,
+            'no_intersection': 0,
+            'outlier': 0,
+        }
+    
+    # Cast rays for all interior vertices
+    print(f"\nCasting rays for {len(interior_points)} vertices...")
+    print(f"  This may take several minutes...")
+    print(f"  Using normal_sign = {normal_sign} ({'NEGATED' if normal_sign < 0 else 'AS-IS'})")
+    print(f"  Ray length = {max_thickness_mm} mm")
+    
+    # Debug: Show details for first few vertices
+    print("\n  DEBUG: Sample ray details for first 5 valid vertices:")
+    debug_count = 0
+    for i in range(len(interior_points)):
+        if debug_count >= 5:
+            break
+        region_id = interior_regions[i]
+        if region_id <= 0:
+            continue
+        
+        pt = interior_points[i]
+        normal = normals[i] * normal_sign
+        ray_start = pt + normal * 0.01
+        ray_end = pt + normal * max_thickness_mm
+        
+        print(f"    Vertex {i} (region {region_id}):")
+        print(f"      Position: ({pt[0]:.2f}, {pt[1]:.2f}, {pt[2]:.2f})")
+        print(f"      Normal (signed): ({normal[0]:.3f}, {normal[1]:.3f}, {normal[2]:.3f})")
+        print(f"      Ray start: ({ray_start[0]:.2f}, {ray_start[1]:.2f}, {ray_start[2]:.2f})")
+        print(f"      Ray end:   ({ray_end[0]:.2f}, {ray_end[1]:.2f}, {ray_end[2]:.2f})")
+        
+        # Test this ray
+        intersection_points = vtk.vtkPoints()
+        result = obb_tree.IntersectWithLine(ray_start, ray_end, intersection_points, None)
+        print(f"      Intersections: {intersection_points.GetNumberOfPoints()}")
+        
+        debug_count += 1
+    
+    print()
+    t1 = time.time()
+    
+    progress_interval = len(interior_points) // 10
+    processed = 0
+    
+    for i in range(len(interior_points)):
+        region_id = interior_regions[i]
+        if region_id <= 0:
+            continue
+        
+        pt = interior_points[i]
+        normal = normals[i] * normal_sign
+        
+        # Cast ray from slightly offset position to avoid self-intersection issues
+        # Start 0.01mm along the normal to ensure clean intersection detection
+        ray_start = pt + normal * 0.01
+        ray_end = pt + normal * max_thickness_mm
+        
+        intersection_points = vtk.vtkPoints()
+        result = obb_tree.IntersectWithLine(ray_start, ray_end, intersection_points, None)
+        
+        if result == 0 or intersection_points.GetNumberOfPoints() == 0:
+            discard_reasons[region_id]['no_intersection'] += 1
+            continue
+        
+        # Find FIRST intersection along ray direction (smallest parametric t)
+        # Don't use closest distance - use parametric distance along ray
+        min_t = float('inf')
+        first_intersection = None
+        ray_direction = normal
+        
+        for j in range(intersection_points.GetNumberOfPoints()):
+            intersection_pt = np.array(intersection_points.GetPoint(j))
+            # Compute parametric distance t along ray: intersection = start + t * direction
+            to_intersection = intersection_pt - pt
+            t = np.dot(to_intersection, ray_direction)
+            
+            if t > 0 and t < min_t:  # Only consider intersections ahead of start point
+                min_t = t
+                first_intersection = intersection_pt
+        
+        if first_intersection is None:
+            discard_reasons[region_id]['no_intersection'] += 1
+            continue
+        
+        distance = min_t  # Parametric distance IS the actual distance since ray_direction is normalized
+        
+        # Apply filters
+        if distance < min_thickness_mm:
+            discard_reasons[region_id]['too_close'] += 1
+            continue
+        
+        if distance > max_thickness_mm:
+            discard_reasons[region_id]['too_far'] += 1
+            continue
+        
+        thickness_by_region[region_id].append(distance)
+        
+        processed += 1
+        if progress_interval > 0 and processed % progress_interval == 0:
+            elapsed = time.time() - t1
+            rate = processed / elapsed if elapsed > 0 else 0
+            remaining = (len(interior_points) - processed) / rate if rate > 0 else 0
+            print(f"    Processed {processed} vertices ({100*processed/len(interior_points):.0f}%), "
+                  f"~{remaining:.0f}s remaining")
+    
+    t2 = time.time()
+    total_time = t2 - t1
+    print(f"\n  Ray casting completed in {total_time:.1f}s")
+    print(f"  Rate: {len(interior_points) / total_time:.0f} vertices/sec")
+    
+    # Report discard statistics
+    print(f"\n  Discard statistics by reason:")
+    total_no_intersection = sum(d['no_intersection'] for d in discard_reasons.values())
+    total_too_close = sum(d['too_close'] for d in discard_reasons.values())
+    total_too_far = sum(d['too_far'] for d in discard_reasons.values())
+    print(f"    No intersection: {total_no_intersection}")
+    print(f"    Too close (<{min_thickness_mm}mm): {total_too_close}")
+    print(f"    Too far (>{max_thickness_mm}mm): {total_too_far}")
+    
+    # === OUTLIER DETECTION PER REGION ===
+    print(f"\nApplying outlier detection (>{outlier_std_threshold}σ)...")
+    outliers_removed = 0
+    
+    for region_id in range(1, 17):
+        if len(thickness_by_region[region_id]) < 10:
+            continue
+        
+        thicknesses = np.array(thickness_by_region[region_id])
+        mean_t = np.mean(thicknesses)
+        std_t = np.std(thicknesses)
+        
+        if std_t < 1e-6:
+            continue
+        
+        lower_bound = mean_t - outlier_std_threshold * std_t
+        upper_bound = mean_t + outlier_std_threshold * std_t
+        
+        filtered = thicknesses[(thicknesses >= lower_bound) & (thicknesses <= upper_bound)]
+        removed = len(thicknesses) - len(filtered)
+        
+        if removed > 0:
+            outliers_removed += removed
+            thickness_by_region[region_id] = filtered.tolist()
+            discard_reasons[region_id]['outlier'] += removed
+    
+    if outliers_removed > 0:
+        print(f"  Removed {outliers_removed} statistical outliers across all regions")
+    else:
+        print(f"  No statistical outliers detected")
+    
+    def total_discards(region_id):
+        return sum(discard_reasons[region_id].values())
+    
+    # Print results
+    region_names = [
+        'Background', 'RSPV', 'LSPV', 'RIPV', 'LIPV', 'MA', 'LAA',
+        'Posterior', 'Roof', 'Inferior', 'Lateral',
+        'Septal', 'Anterior', 'RSPV_Ostium', 'LSPV_Ostium',
+        'RIPV_Ostium', 'LIPV_Ostium'
+    ]
+    
+    csv_filename = base_path + '_wall_thickness_accurate.csv'
+    results_data = []
+    
+    # Print WALL REGIONS
+    print("\n" + "="*120)
+    print("  WALL THICKNESS RESULTS - PRIMARY WALL REGIONS (Ray Casting)")
+    print("="*120)
+    print(f"{'Region':<8} {'Name':<18} {'Avg (mm)':<12} {'Std Dev':<12} {'Valid':<10} {'NoHit':<10} {'TooClose':<10} {'TooFar':<10} {'Outlier':<10}")
+    print("-" * 120)
+    
+    for region_id in [7, 8, 9, 10, 11, 12]:
+        if region_id in thickness_by_region and len(thickness_by_region[region_id]) > 0:
+            thicknesses = thickness_by_region[region_id]
+            avg_thickness = np.mean(thicknesses)
+            std_thickness = np.std(thicknesses)
+            num_valid = len(thicknesses)
+            name = region_names[region_id]
+            dr = discard_reasons[region_id]
+            
+            print(f"{region_id:<8} {name:<18} {avg_thickness:<12.3f} {std_thickness:<12.3f} {num_valid:<10} {dr['no_intersection']:<10} {dr['too_close']:<10} {dr['too_far']:<10} {dr['outlier']:<10}")
+            
+            results_data.append({
+                'Region_ID': region_id,
+                'Region_Name': name,
+                'Category': 'Wall',
+                'Avg_Thickness_mm': round(avg_thickness, 4),
+                'Std_Dev_mm': round(std_thickness, 4),
+                'Valid_Vertices': num_valid,
+                'Discard_NoIntersection': dr['no_intersection'],
+                'Discard_TooClose': dr['too_close'],
+                'Discard_TooFar': dr['too_far'],
+                'Discard_Outlier': dr['outlier'],
+                'Total_Vertices': num_valid + total_discards(region_id)
+            })
+    
+    print("-" * 120)
+    
+    # Print OSTIUM REGIONS
+    print("\n  OSTIUM REGIONS (Transition Zones)")
+    print("-" * 120)
+    print(f"{'Region':<8} {'Name':<18} {'Avg (mm)':<12} {'Std Dev':<12} {'Valid':<10} {'NoHit':<10} {'TooClose':<10} {'TooFar':<10} {'Outlier':<10}")
+    print("-" * 120)
+    
+    for region_id in [13, 14, 15, 16]:
+        if region_id in thickness_by_region and len(thickness_by_region[region_id]) > 0:
+            thicknesses = thickness_by_region[region_id]
+            avg_thickness = np.mean(thicknesses)
+            std_thickness = np.std(thicknesses)
+            num_valid = len(thicknesses)
+            name = region_names[region_id]
+            dr = discard_reasons[region_id]
+            
+            print(f"{region_id:<8} {name:<18} {avg_thickness:<12.3f} {std_thickness:<12.3f} {num_valid:<10} {dr['no_intersection']:<10} {dr['too_close']:<10} {dr['too_far']:<10} {dr['outlier']:<10}")
+            
+            results_data.append({
+                'Region_ID': region_id,
+                'Region_Name': name,
+                'Category': 'Ostium',
+                'Avg_Thickness_mm': round(avg_thickness, 4),
+                'Std_Dev_mm': round(std_thickness, 4),
+                'Valid_Vertices': num_valid,
+                'Discard_NoIntersection': dr['no_intersection'],
+                'Discard_TooClose': dr['too_close'],
+                'Discard_TooFar': dr['too_far'],
+                'Discard_Outlier': dr['outlier'],
+                'Total_Vertices': num_valid + total_discards(region_id)
+            })
+    
+    print("-" * 120)
+    
+    # Print PV and OTHER REGIONS
+    print("\n  PV & SPECIAL STRUCTURES")
+    print("-" * 120)
+    print(f"{'Region':<8} {'Name':<18} {'Avg (mm)':<12} {'Std Dev':<12} {'Valid':<10} {'NoHit':<10} {'TooClose':<10} {'TooFar':<10} {'Outlier':<10}")
+    print("-" * 120)
+    
+    for region_id in [1, 2, 3, 4, 5, 6]:
+        if region_id in thickness_by_region:
+            thicknesses = thickness_by_region[region_id]
+            name = region_names[region_id]
+            dr = discard_reasons[region_id]
+            
+            if len(thicknesses) > 0:
+                avg_thickness = np.mean(thicknesses)
+                std_thickness = np.std(thicknesses)
+                num_valid = len(thicknesses)
+                print(f"{region_id:<8} {name:<18} {avg_thickness:<12.3f} {std_thickness:<12.3f} {num_valid:<10} {dr['no_intersection']:<10} {dr['too_close']:<10} {dr['too_far']:<10} {dr['outlier']:<10}")
+                
+                results_data.append({
+                    'Region_ID': region_id,
+                    'Region_Name': name,
+                    'Category': 'PV/Special',
+                    'Avg_Thickness_mm': round(avg_thickness, 4),
+                    'Std_Dev_mm': round(std_thickness, 4),
+                    'Valid_Vertices': num_valid,
+                    'Discard_NoIntersection': dr['no_intersection'],
+                    'Discard_TooClose': dr['too_close'],
+                    'Discard_TooFar': dr['too_far'],
+                    'Discard_Outlier': dr['outlier'],
+                    'Total_Vertices': num_valid + total_discards(region_id)
+                })
+            elif total_discards(region_id) > 0:
+                print(f"{region_id:<8} {name:<18} {'N/A':<12} {'N/A':<12} {0:<10} {dr['no_intersection']:<10} {dr['too_close']:<10} {dr['too_far']:<10} {dr['outlier']:<10}")
+                
+                results_data.append({
+                    'Region_ID': region_id,
+                    'Region_Name': name,
+                    'Category': 'PV/Special',
+                    'Avg_Thickness_mm': 'N/A',
+                    'Std_Dev_mm': 'N/A',
+                    'Valid_Vertices': 0,
+                    'Discard_NoIntersection': dr['no_intersection'],
+                    'Discard_TooClose': dr['too_close'],
+                    'Discard_TooFar': dr['too_far'],
+                    'Discard_Outlier': dr['outlier'],
+                    'Total_Vertices': total_discards(region_id)
+                })
+    
+    print("-" * 120)
+    
+    # Write results to CSV
+    if results_data:
+        print(f"\nSaving results to CSV: {csv_filename}")
+        try:
+            with open(csv_filename, 'w', newline='') as csvfile:
+                fieldnames = ['Region_ID', 'Region_Name', 'Category', 'Avg_Thickness_mm', 'Std_Dev_mm',
+                             'Valid_Vertices', 'Discard_NoIntersection', 'Discard_TooClose',
+                             'Discard_TooFar', 'Discard_Outlier', 'Total_Vertices']
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(results_data)
@@ -2443,11 +3291,13 @@ def main():
             return
     
     interior = LASegmenter(args.file)
-    interior_regions = interior.run()
+    result = interior.run()
     
     # Check if segmentation was successful
-    if interior_regions is None:
+    if result is None or result[0] is None:
         return
+    
+    interior_regions, thickness_mode = result
 
 # dialog to select epicardium file
     f = filedialog.askopenfilename(defaultextension=".vtk", title="Select epicardium mesh file")
@@ -2458,11 +3308,30 @@ def main():
 # build epicardium mesh and graph        
     exterior = LASegmenter(f)
     exterior.load_mesh()
-    exterior.center_mesh()
+    
+    # Apply the SAME centering offset as interior mesh to maintain alignment
+    if hasattr(interior, 'centering_offset'):
+        print(f"\nApplying interior centering offset to exterior mesh...")
+        print(f"  Offset: ({interior.centering_offset[0]:.2f}, {interior.centering_offset[1]:.2f}, {interior.centering_offset[2]:.2f})")
+        exterior.center_mesh(offset=interior.centering_offset)
+    else:
+        print("\n⚠ Warning: Interior mesh centering offset not found.")
+        print("  Exterior mesh will not be centered (assuming pre-aligned meshes).")
+    
     exterior.build_graph()
     
     # Calculate wall thickness using computed regions
-    calculate_wall_thickness(interior, exterior.mesh, interior_regions)
+    if thickness_mode == 'both':
+        # Run both algorithms sequentially
+        print("\n" + "="*60)
+        print("  RUNNING BOTH THICKNESS ALGORITHMS")
+        print("="*60)
+        calculate_wall_thickness(interior, exterior.mesh, interior_regions)
+        calculate_wall_thickness_full(interior, exterior.mesh, interior_regions)
+    elif thickness_mode == 'slow':
+        calculate_wall_thickness_full(interior, exterior.mesh, interior_regions)
+    else:
+        calculate_wall_thickness(interior, exterior.mesh, interior_regions)
 
 # visualize epidecarium
     mapper = vtk.vtkPolyDataMapper()
