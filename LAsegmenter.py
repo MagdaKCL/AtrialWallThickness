@@ -1338,7 +1338,8 @@ class LASegmenter:
         # Third axis length = 2 * (major_axis_length + minor_axis_length)
         major_axis_length = 2 * semi_axis1
         minor_axis_length = 2 * semi_axis2
-        semi_axis3 = (major_axis_length + minor_axis_length)/4.0
+        #semi_axis3 = (major_axis_length + minor_axis_length)/4.0
+        semi_axis3 = 10.0  # Fixed thickness for MA region
         
         # Add 2mm margin to all axes
         margin = 2.0
