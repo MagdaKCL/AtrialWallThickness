@@ -349,7 +349,9 @@ class LASegmenter:
             'ma_point_id': None, 'ma_coords': None, 'done': False,
             'regions': np.zeros(len(self.points), dtype=int), 'region_actor': None,
             'exit_reason': None,  # Track why we're exiting
-            'review_mode': False   # Track if we're reviewing a landmark
+            'review_mode': False,   # Track if we're reviewing a landmark
+            'lspv_second_plane': False,  # Track if we need second plane for LSPV
+            'lspv_first_plane_stored': False  # Track if first LSPV plane is stored
         }
         
         text = vtk.vtkTextActor()
@@ -767,23 +769,32 @@ class LASegmenter:
                             if ostium_region_id in state['regions']:
                                 state['regions'][state['regions'] == ostium_region_id] = 0
                         
-                        # Remove the marker and ring from permanent list (last 2 actors added for this PV)
+                        # For LSPV with two planes, remove both marker+ring pairs (4 actors total)
+                        # For other PVs, remove one marker+ring pair (2 actors total)
                         # Note: disk was removed from renderer immediately and not added to permanent
                         to_remove_count = 0
                         if state['permanent']:
-                            # Check if last actor is the ring (was it added?)
-                            if len(state['permanent']) >= 2:
-                                # Remove last 2: ring and marker
-                                removed_ring = state['permanent'].pop()
-                                removed_marker = state['permanent'].pop()
-                                renderer.RemoveActor(removed_ring)
-                                renderer.RemoveActor(removed_marker)
-                                to_remove_count = 2
-                            elif len(state['permanent']) >= 1:
-                                # Remove last 1: marker
-                                removed_marker = state['permanent'].pop()
-                                renderer.RemoveActor(removed_marker)
-                                to_remove_count = 1
+                            if region == 'LSPV' and state['lspv_first_plane_stored']:
+                                # LSPV with two planes: remove 4 actors (2 marker+ring pairs)
+                                actors_to_remove = min(4, len(state['permanent']))
+                                for _ in range(actors_to_remove):
+                                    removed_actor = state['permanent'].pop()
+                                    renderer.RemoveActor(removed_actor)
+                                to_remove_count = actors_to_remove
+                            else:
+                                # Other PVs: remove 2 actors (1 marker+ring pair)
+                                if len(state['permanent']) >= 2:
+                                    # Remove last 2: ring and marker
+                                    removed_ring = state['permanent'].pop()
+                                    removed_marker = state['permanent'].pop()
+                                    renderer.RemoveActor(removed_ring)
+                                    renderer.RemoveActor(removed_marker)
+                                    to_remove_count = 2
+                                elif len(state['permanent']) >= 1:
+                                    # Remove last 1: marker
+                                    removed_marker = state['permanent'].pop()
+                                    renderer.RemoveActor(removed_marker)
+                                    to_remove_count = 1
                         
                         # Remove ring and disk if they exist in current state
                         if state['ring']:
@@ -792,6 +803,15 @@ class LASegmenter:
                         if state['disk']:
                             renderer.RemoveActor(state['disk'])
                             state['disk'] = None
+                        
+                        # Delete stored markers for this PV
+                        if f'{region}_distal' in self.markers:
+                            del self.markers[f'{region}_distal']
+                        if f'{region}_ostium' in self.markers:
+                            del self.markers[f'{region}_ostium']
+                        # For LSPV, also delete the second ostium if it exists
+                        if region == 'LSPV' and f'{region}_ostium2' in self.markers:
+                            del self.markers[f'{region}_ostium2']
                         
                         # Reset PV state variables
                         state['tip_id'] = None
@@ -803,6 +823,11 @@ class LASegmenter:
                         state['offset'] = 0
                         state['tilt_fb'] = 0
                         state['tilt_lr'] = 0
+                        
+                        # Reset LSPV-specific flags
+                        if region == 'LSPV':
+                            state['lspv_second_plane'] = False
+                            state['lspv_first_plane_stored'] = False
                         
                         if state['marker']:
                             renderer.RemoveActor(state['marker'])
@@ -817,6 +842,29 @@ class LASegmenter:
                     return
                 else:
                     return  # Ignore other keys in review mode
+            
+            # Handle ESC to skip second LSPV plane creation
+            if key == 'Escape' and not state['review_mode']:
+                region, ltype, desc = self.landmark_sequence[state['idx']]
+                # Check if we're in the middle of creating the second LSPV plane
+                if region == 'LSPV' and state['lspv_second_plane'] and not state['plane_pos']:
+                    # User wants to skip second plane - proceed with just the first plane
+                    print(f"  Skipping second plane for {region}")
+                    
+                    # Reset second plane flags
+                    state['lspv_second_plane'] = False
+                    
+                    # Create the region with just the first plane
+                    print(f"\nCreating {region} region and ostium with one plane...")
+                    self.create_pv_regions(state['regions'], region)
+                    update_region_visualization()
+                    
+                    # Enter review mode
+                    state['review_mode'] = True
+                    text.SetInput(f"{region} REVIEW: SPACE=accept, ESC=undo")
+                    text.GetTextProperty().SetColor(0, 1, 1)
+                    window.Render()
+                    return
             
             if ltype == 'vein' and state['plane_pos'] is not None:
                 # Get camera vectors for viewport-relative controls
@@ -962,6 +1010,94 @@ class LASegmenter:
             
             if key == 'space':
                 if ltype == 'vein' and state['plane_pos'] is not None:
+                    # Check if this is LSPV and we haven't stored the first plane yet
+                    if region == 'LSPV' and not state['lspv_first_plane_stored']:
+                        # Store first plane for LSPV
+                        self.markers[f"{region}_distal"] = {
+                            'point_id': state['tip_id'],
+                            'coords': state['tip_pos'].copy(),
+                        }
+                        self.markers[f"{region}_ostium"] = {
+                            'coords': state['plane_pos'].copy(),
+                            'normal': state['plane_normal'].copy(),
+                            'radius': state['radius'],
+                            'point_id': None,
+                        }
+                        print(f"  ✓ {region} first plane: offset={state['offset']:.1f}mm, r={state['radius']:.1f}mm")
+                        
+                        if state['marker']:
+                            state['marker'].GetProperty().SetOpacity(0.5)
+                            state['permanent'].append(state['marker'])
+                            state['marker'] = None
+                        if state['ring']:
+                            state['ring'].GetProperty().SetOpacity(0.5)
+                            state['permanent'].append(state['ring'])
+                            state['ring'] = None
+                        if state['disk']:
+                            renderer.RemoveActor(state['disk'])
+                            state['disk'] = None
+                        
+                        # Reset plane state for second plane
+                        state['tip_id'] = None
+                        state['tip_pos'] = None
+                        state['plane_pos'] = None
+                        state['plane_normal'] = None
+                        state['base_normal'] = None
+                        state['offset'] = 0
+                        state['tilt_fb'] = 0
+                        state['tilt_lr'] = 0
+                        state['radius'] = self.default_ostium_radius
+                        
+                        # Mark that we need second plane
+                        state['lspv_first_plane_stored'] = True
+                        state['lspv_second_plane'] = True
+                        
+                        # Update text to prompt for second plane
+                        text.SetInput(f"[{state['idx']+1}/{len(self.landmark_sequence)}] LSPV - Click TIP for SECOND cutting plane")
+                        text.GetTextProperty().SetColor(1, 0.5, 0)
+                        window.Render()
+                        return
+                    
+                    # Check if this is the second LSPV plane
+                    if region == 'LSPV' and state['lspv_second_plane']:
+                        # Store second plane for LSPV
+                        self.markers[f"{region}_ostium2"] = {
+                            'coords': state['plane_pos'].copy(),
+                            'normal': state['plane_normal'].copy(),
+                            'radius': state['radius'],
+                            'point_id': None,
+                        }
+                        print(f"  ✓ {region} second plane: offset={state['offset']:.1f}mm, r={state['radius']:.1f}mm")
+                        
+                        if state['marker']:
+                            state['marker'].GetProperty().SetOpacity(0.5)
+                            state['permanent'].append(state['marker'])
+                            state['marker'] = None
+                        if state['ring']:
+                            state['ring'].GetProperty().SetOpacity(0.5)
+                            state['permanent'].append(state['ring'])
+                            state['ring'] = None
+                        if state['disk']:
+                            renderer.RemoveActor(state['disk'])
+                            state['disk'] = None
+                        
+                        # Reset flags
+                        state['lspv_second_plane'] = False
+                        state['plane_pos'] = None
+                        
+                        # Now create the region with both planes
+                        print(f"\nCreating {region} region and ostium with two planes...")
+                        self.create_pv_regions(state['regions'], region)
+                        update_region_visualization()
+                        
+                        # Enter review mode
+                        state['review_mode'] = True
+                        text.SetInput(f"{region} REVIEW: SPACE=accept, ESC=undo")
+                        text.GetTextProperty().SetColor(0, 1, 1)
+                        window.Render()
+                        return
+                    
+                    # Standard single plane for other veins
                     self.markers[f"{region}_distal"] = {
                         'point_id': state['tip_id'],
                         'coords': state['tip_pos'].copy(),
@@ -1384,7 +1520,8 @@ class LASegmenter:
     
     
     def create_pv_regions(self, regions, pv_name):
-        """Create PV region and ostium ring for a single PV."""
+        """Create PV region and ostium ring for a single PV.
+        For LSPV, uses two cutting planes if second plane is defined."""
         pv_rid_map = {'RSPV': 1, 'LSPV': 2, 'RIPV': 3, 'LIPV': 4, 'LAA': 6}
         ost_rid_map = {'RSPV': 13, 'LSPV': 14, 'RIPV': 15, 'LIPV': 16}
         
@@ -1402,14 +1539,33 @@ class LASegmenter:
             if np.sign(np.dot(pt - center, normal)) == distal_side:
                 candidates[i] = True
         
+        # If LSPV has a second plane, further restrict candidates
+        if pv_name == 'LSPV' and f'{pv_name}_ostium2' in self.markers:
+            ost2 = self.markers[f'{pv_name}_ostium2']
+            center2, normal2 = ost2['coords'], ost2['normal']
+            
+            # Determine which side of second plane should be included
+            # The tip should be on the included side
+            distal_side2 = np.sign(np.dot(distal_pt - center2, normal2))
+            
+            # Further restrict candidates - must be on correct side of BOTH planes
+            for i, pt in enumerate(self.points):
+                if candidates[i]:
+                    if np.sign(np.dot(pt - center2, normal2)) != distal_side2:
+                        candidates[i] = False
+        
         connected = self.find_connected_component(tip_id, candidates)
         for vid in connected:
             if regions[vid] == 0:
                 regions[vid] = pv_rid
         
-        print(f"  {pv_name}: {len(connected)}")
+        if pv_name == 'LSPV' and f'{pv_name}_ostium2' in self.markers:
+            print(f"  {pv_name}: {len(connected)} (with two planes)")
+        else:
+            print(f"  {pv_name}: {len(connected)}")
         
         # Create ostium ring (if not LAA)
+        # For LSPV with two planes, only create ostium ring near the first plane (closer to atrium)
         if pv_name != 'LAA':
             ost_rid = ost_rid_map[pv_name]
             border_verts = self.get_pv_border_vertices(regions, pv_rid)
@@ -1417,6 +1573,29 @@ class LASegmenter:
             if len(border_verts) > 0:
                 dist_from_border = self.compute_geodesic_distance_from_set(border_verts)
                 candidate_ostium = set()
+                
+                # For LSPV with two planes, filter border vertices to only those near first plane
+                if pv_name == 'LSPV' and f'{pv_name}_ostium2' in self.markers:
+                    # Get first plane parameters
+                    first_plane_center = ost['coords']
+                    second_plane_center = self.markers[f'{pv_name}_ostium2']['coords']
+                    
+                    # Filter border vertices - keep only those closer to first plane than second plane
+                    # AND significantly closer (to avoid intersection area)
+                    filtered_border_verts = []
+                    for v in border_verts:
+                        dist_to_first = np.linalg.norm(self.points[v] - first_plane_center)
+                        dist_to_second = np.linalg.norm(self.points[v] - second_plane_center)
+                        # Only include if at least 30% closer to first plane (avoids intersection zone)
+                        if dist_to_first < dist_to_second * 0.7:
+                            filtered_border_verts.append(v)
+                    
+                    # Recompute distances from filtered border vertices
+                    if filtered_border_verts:
+                        dist_from_border = self.compute_geodesic_distance_from_set(filtered_border_verts)
+                        # Update border_verts to be the filtered set for adjacency checks later
+                        border_verts = filtered_border_verts
+                
                 for i in range(len(self.points)):
                     if regions[i] != 0:
                         continue
@@ -1455,7 +1634,7 @@ class LASegmenter:
         # Get ostia centers
         ostia_centers = {}
         for pv in ['RSPV', 'LSPV', 'RIPV', 'LIPV']:
-            pv_rid = {'RSPV': 1, 'LSPV': 2, 'RIPV': 3, 'LIPV': 4}[pv]
+            pv_rid = {'RSPV': 13, 'LSPV': 14, 'RIPV': 15, 'LIPV': 16}[pv]
             border_verts = self.get_pv_border_vertices(regions, pv_rid)
             if len(border_verts) > 0:
                 border_positions = np.array([self.points[v] for v in border_verts])
@@ -1686,6 +1865,13 @@ class LASegmenter:
             'ant_plane_right_normal': ant_plane_right_normal,
             'ant_plane_left_pt': ant_plane_left_pt,
             'ant_plane_left_normal': ant_plane_left_normal,
+            'roof_right_plane_pt': roof_right_plane_pt,
+            'roof_right_plane_normal': roof_right_plane_normal,
+            'roof_left_plane_pt': roof_left_plane_pt,
+            'roof_left_plane_normal': roof_left_plane_normal,
+            'laa_left_plane_pt': laa_left_plane_pt,
+            'laa_left_plane_normal': laa_left_plane_normal,
+            'laa_leftmost_vid': laa_leftmost_vid,  # Debug: vertex ID of LAA leftmost boundary point
             'septal_wall_plane_pt': septal_wall_plane_pt,
             'septal_wall_plane_normal': septal_wall_plane_normal,
         }
@@ -1705,18 +1891,22 @@ class LASegmenter:
     def create_roof_wall(self, regions, geom):
         """Create roof wall region (rid=8)."""
         dist_post_top = self.signed_distance_to_plane(self.points, geom['post_top_plane_pt'], geom['post_top_plane_normal'])
-        dist_post_right = self.signed_distance_to_plane(self.points, geom['post_right_plane_pt'], geom['post_right_plane_normal'])
-        dist_post_left = self.signed_distance_to_plane(self.points, geom['post_left_plane_pt'], geom['post_left_plane_normal'])
         
         dist_roof_ant = np.zeros(len(self.points))
         if geom['roof_ant_plane_pt'] is not None:
             dist_roof_ant = self.signed_distance_to_plane(self.points, geom['roof_ant_plane_pt'], geom['roof_ant_plane_normal'])
         
-        dist_ant_right = self.signed_distance_to_plane(self.points, geom['rspv_ost_center'], geom['lr_axis'])
-        dist_ant_left = self.signed_distance_to_plane(self.points, geom['lspv_ost_center'], geom['lr_axis'])
+        # Use roof-specific side planes constructed from anterior vertices
+        dist_roof_right = np.zeros(len(self.points))
+        dist_roof_left = np.zeros(len(self.points))
+        if geom['roof_right_plane_pt'] is not None:
+            dist_roof_right = self.signed_distance_to_plane(self.points, geom['roof_right_plane_pt'], geom['roof_right_plane_normal'])
+        if geom['roof_left_plane_pt'] is not None:
+            dist_roof_left = self.signed_distance_to_plane(self.points, geom['roof_left_plane_pt'], geom['roof_left_plane_normal'])
         
         unassigned = regions == 0
-        roof_mask = (unassigned & (dist_post_top < 0) & (dist_roof_ant < 0) & (dist_ant_right < 0) & (dist_ant_left > 0))
+        # Roof is bounded by: post_top (posterior), roof_ant (anterior), and roof side planes (left/right)
+        roof_mask = (unassigned & (dist_post_top < 0) & (dist_roof_ant < 0) & (dist_roof_right > 0) & (dist_roof_left > 0))
         regions[roof_mask] = 8
         print(f"  Roof: {np.sum(regions == 8)}")
     
@@ -1752,6 +1942,11 @@ class LASegmenter:
             dist_ant_right = self.signed_distance_to_plane(self.points, geom['ant_plane_right_pt'], geom['ant_plane_right_normal'])
         if geom['ant_plane_left_pt'] is not None:
             dist_ant_left = self.signed_distance_to_plane(self.points, geom['ant_plane_left_pt'], geom['ant_plane_left_normal'])
+        
+        # LAA leftmost boundary constraint - prevents anterior wall from extending too far left
+        dist_laa_left = np.zeros(len(self.points))
+        if geom['laa_left_plane_pt'] is not None:
+            dist_laa_left = self.signed_distance_to_plane(self.points, geom['laa_left_plane_pt'], geom['laa_left_plane_normal'])
         
         unassigned = regions == 0
         # Anterior wall is:
@@ -2198,6 +2393,9 @@ class LASegmenter:
     
     def run(self):
         # Load from checkpoint if this is a .wrk file
+        if self.vtk_file is None:
+            print("Error: No file specified")
+            return None
         if self.vtk_file.endswith('.wrk'):
             segmenter = LASegmenter.load_from_checkpoint(self.vtk_file)
             if segmenter is None:
@@ -2389,6 +2587,10 @@ def main():
     args = parser.parse_args()
     
     if args.file is None:
+        if tk is None:
+            print("Error: tkinter not available. Please install tkinter or provide file as argument:")
+            print("  Usage: python LAsegmenter.py /path/to/file.vtk")
+            return
         try:
             if tk:
                 root = tk.Tk()
