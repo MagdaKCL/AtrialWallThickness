@@ -1772,32 +1772,8 @@ class LASegmenter:
             # Get lower boundary vertices (touching regions other than RSPV_Ostium=13 and RSPV=1)
             rspv_lower = get_lower_boundary_vertices(rspv_ostium, 13, 1)
             if rspv_lower is not None and len(rspv_lower) > 0:
-                # Filter to only SUPERIOR side of lower boundary (positive SI scores)
-                si_scores = np.dot(self.points[rspv_lower] - ostia_centers['RSPV'], si_axis)
-                superior_mask = si_scores > 0  # Only vertices above the ostium center
-                rspv_superior = rspv_lower[superior_mask]
-                
-                if len(rspv_superior) > 0:
-                    # Now filter to middle 10% of the superior vertices
-                    si_scores_sup = si_scores[superior_mask]
-                    si_min, si_max = np.min(si_scores_sup), np.max(si_scores_sup)
-                    si_range = si_max - si_min
-                    si_mid_min = si_min + si_range * 0.45
-                    si_mid_max = si_max - si_range * 0.45
-                    middle_mask = (si_scores_sup >= si_mid_min) & (si_scores_sup <= si_mid_max)
-                    rspv_middle = rspv_superior[middle_mask]
-                else:
-                    # Fallback if no superior vertices
-                    rspv_middle = np.array([])
-                
-                if len(rspv_middle) > 0:
-                    # Find most anterior vertex from middle range
-                    ap_scores = np.dot(self.points[rspv_middle] - ostia_centers['RSPV'], ap_axis)
-                    rspv_anterior_vid = rspv_middle[np.argmin(ap_scores)]
-                else:
-                    # Fallback if middle range is empty
-                    ap_scores = np.dot(self.points[rspv_lower] - ostia_centers['RSPV'], ap_axis)
-                    rspv_anterior_vid = rspv_lower[np.argmin(ap_scores)]
+                ap_scores = np.dot(self.points[rspv_lower] - ostia_centers['RSPV'], ap_axis)
+                rspv_anterior_vid = rspv_lower[np.argmin(ap_scores)]
             else:
                 # Fallback: use any ostium vertex with minimum AP score
                 ap_scores = np.dot(self.points[rspv_ostium] - ostia_centers['RSPV'], ap_axis)
@@ -1807,32 +1783,8 @@ class LASegmenter:
             # Get lower boundary vertices (touching regions other than LSPV_Ostium=14 and LSPV=2)
             lspv_lower = get_lower_boundary_vertices(lspv_ostium, 14, 2)
             if lspv_lower is not None and len(lspv_lower) > 0:
-                # Filter to only SUPERIOR side of lower boundary (positive SI scores)
-                si_scores = np.dot(self.points[lspv_lower] - ostia_centers['LSPV'], si_axis)
-                superior_mask = si_scores > 0  # Only vertices above the ostium center
-                lspv_superior = lspv_lower[superior_mask]
-                
-                if len(lspv_superior) > 0:
-                    # Now filter to middle 10% of the superior vertices
-                    si_scores_sup = si_scores[superior_mask]
-                    si_min, si_max = np.min(si_scores_sup), np.max(si_scores_sup)
-                    si_range = si_max - si_min
-                    si_mid_min = si_min + si_range * 0.45
-                    si_mid_max = si_max - si_range * 0.45
-                    middle_mask = (si_scores_sup >= si_mid_min) & (si_scores_sup <= si_mid_max)
-                    lspv_middle = lspv_superior[middle_mask]
-                else:
-                    # Fallback if no superior vertices
-                    lspv_middle = np.array([])
-                
-                if len(lspv_middle) > 0:
-                    # Find most anterior vertex from middle range
-                    ap_scores = np.dot(self.points[lspv_middle] - ostia_centers['LSPV'], ap_axis)
-                    lspv_anterior_vid = lspv_middle[np.argmin(ap_scores)]
-                else:
-                    # Fallback if middle range is empty
-                    ap_scores = np.dot(self.points[lspv_lower] - ostia_centers['LSPV'], ap_axis)
-                    lspv_anterior_vid = lspv_lower[np.argmin(ap_scores)]
+                ap_scores = np.dot(self.points[lspv_lower] - ostia_centers['LSPV'], ap_axis)
+                lspv_anterior_vid = lspv_lower[np.argmin(ap_scores)]
             else:
                 # Fallback: use any ostium vertex with minimum AP score
                 ap_scores = np.dot(self.points[lspv_ostium] - ostia_centers['LSPV'], ap_axis)
@@ -1861,76 +1813,19 @@ class LASegmenter:
         rspv_ost_center = ostia_centers['RSPV']
         lspv_ost_center = ostia_centers['LSPV']
         
-        # Right anterior plane: through RSPV anterior vertex, MA center, and heart center
-        if rspv_anterior_vid is not None:
-            ant_plane_right_pt, ant_plane_right_normal = make_plane(self.points[rspv_anterior_vid], ma_center, heart_center)
-        else:
-            ant_plane_right_pt, ant_plane_right_normal = make_plane(rspv_ost_center, ma_center, heart_center)
+        # Right anterior plane: through RSPV ostia center, MA center, and heart center
+        ant_plane_right_pt, ant_plane_right_normal = make_plane(rspv_ost_center, ma_center, heart_center)
         # Normal should point toward the LEFT (inward, toward center of anterior region)
         to_left = lspv_ost_center - rspv_ost_center
         if np.dot(ant_plane_right_normal, to_left) < 0:
             ant_plane_right_normal = -ant_plane_right_normal
         
-        # Left anterior plane: through LSPV anterior vertex, MA center, and heart center
-        if lspv_anterior_vid is not None:
-            ant_plane_left_pt, ant_plane_left_normal = make_plane(self.points[lspv_anterior_vid], ma_center, heart_center)
-        else:
-            ant_plane_left_pt, ant_plane_left_normal = make_plane(lspv_ost_center, ma_center, heart_center)
+        # Left anterior plane: through LSPV ostia center, MA center, and heart center
+        ant_plane_left_pt, ant_plane_left_normal = make_plane(lspv_ost_center, ma_center, heart_center)
         # Normal should point toward the RIGHT (inward, toward center of anterior region)
         to_right = rspv_ost_center - lspv_ost_center
         if np.dot(ant_plane_left_normal, to_right) < 0:
             ant_plane_left_normal = -ant_plane_left_normal
-        
-        # Roof side planes - use anterior vertices for more accurate roof boundaries
-        roof_right_plane_pt = None
-        roof_right_plane_normal = None
-        roof_left_plane_pt = None
-        roof_left_plane_normal = None
-        
-        # Right roof plane: through RSPV anterior vertex, RSPV ostium center, and heart center
-        if rspv_anterior_vid is not None:
-            roof_right_plane_pt, roof_right_plane_normal = make_plane(self.points[rspv_anterior_vid], rspv_ost_center, heart_center)
-            # Normal should point toward the LEFT (inward, toward roof center)
-            to_left = lspv_ost_center - rspv_ost_center
-            if np.dot(roof_right_plane_normal, to_left) < 0:
-                roof_right_plane_normal = -roof_right_plane_normal
-        
-        # Left roof plane: through LSPV anterior vertex, LSPV ostium center, and heart center
-        if lspv_anterior_vid is not None:
-            roof_left_plane_pt, roof_left_plane_normal = make_plane(self.points[lspv_anterior_vid], lspv_ost_center, heart_center)
-            # Normal should point toward the RIGHT (inward, toward roof center)
-            to_right = rspv_ost_center - lspv_ost_center
-            if np.dot(roof_left_plane_normal, to_right) < 0:
-                roof_left_plane_normal = -roof_left_plane_normal
-        
-        # LAA leftmost boundary plane - constrains anterior wall from extending too far left
-        laa_left_plane_pt = None
-        laa_left_plane_normal = None
-        laa_leftmost_vid = None
-        
-        laa_region = np.where(regions == 6)[0]  # LAA region ID is 6
-        if len(laa_region) > 0:
-            # Find LAA boundary vertices (vertices with neighbors in other regions)
-            laa_boundary = set()
-            for vid in laa_region:
-                for neighbor in self.graph.neighbors(vid):
-                    if regions[neighbor] != 6:  # Neighbor is not LAA
-                        laa_boundary.add(vid)
-                        break
-            
-            if laa_boundary:
-                # Find leftmost vertex (minimum LR projection)
-                laa_boundary_list = list(laa_boundary)
-                lr_scores = np.dot(self.points[laa_boundary_list], lr_axis)
-                leftmost_idx = np.argmin(lr_scores)
-                laa_leftmost_vid = laa_boundary_list[leftmost_idx]
-                
-                # Create plane through MA center, heart center, and LAA leftmost vertex
-                laa_left_plane_pt, laa_left_plane_normal = make_plane(self.points[laa_leftmost_vid], ma_center, heart_center)
-                # Normal should point toward the RIGHT (inward, away from LAA)
-                # Check using LR axis: normal should point in positive LR direction (toward right)
-                if np.dot(laa_left_plane_normal, lr_axis) < 0:
-                    laa_left_plane_normal = -laa_left_plane_normal
         
         # Septal wall plane - parallel to SI axis, passing through MA center
         # Normal is perpendicular to SI axis (use LR axis as the plane normal)
@@ -2057,12 +1952,7 @@ class LASegmenter:
         # Anterior wall is:
         # - In front of roof_ant plane (dist_roof_ant > 0, since normal points toward MA/anterior)
         # - On the inward side of both left and right planes (dist > 0, since normals point inward)
-        # - To the RIGHT of LAA leftmost boundary plane (dist_laa_left > 0, since normal points right)
-        if geom['laa_left_plane_pt'] is not None:
-            anterior_mask = (unassigned & (dist_roof_ant > 0) & (dist_ant_right > 0) & (dist_ant_left > 0) & (dist_laa_left > 0))
-        else:
-            # Fallback if LAA boundary plane couldn't be calculated
-            anterior_mask = (unassigned & (dist_roof_ant > 0) & (dist_ant_right > 0) & (dist_ant_left > 0))
+        anterior_mask = (unassigned & (dist_roof_ant > 0) & (dist_ant_right > 0) & (dist_ant_left > 0))
 
         regions[anterior_mask] = 12
         print(f"  Anterior: {np.sum(regions == 12)}")
@@ -2230,22 +2120,6 @@ class LASegmenter:
                 la.SetMapper(lm)
                 la.GetProperty().SetColor(1, 1, 0)  # Yellow line
                 renderer.AddActor(la)
-            
-            # Visualize LAA leftmost boundary point
-            laa_leftmost_vid = geom.get('laa_leftmost_vid')
-            if laa_leftmost_vid is not None:
-                sphere = vtk.vtkSphereSource()
-                sphere.SetCenter(*self.points[laa_leftmost_vid])
-                sphere.SetRadius(2.0)
-                sphere.SetPhiResolution(16)
-                sphere.SetThetaResolution(16)
-                sm = vtk.vtkPolyDataMapper()
-                sm.SetInputConnection(sphere.GetOutputPort())
-                sa = vtk.vtkActor()
-                sa.SetMapper(sm)
-                sa.GetProperty().SetColor(0, 1, 0)  # Green for LAA leftmost
-                renderer.AddActor(sa)
-                print(f"  DEBUG: LAA leftmost point vid={laa_leftmost_vid} at {self.points[laa_leftmost_vid]}")
         
         # Add text display for title and keybindings
         text_actor = vtk.vtkTextActor()
@@ -2465,7 +2339,7 @@ class LASegmenter:
         if self.exterior_mesh:
             print("  Appending exterior mesh to output...")
             ext_arr = vtk.vtkIntArray()
-            ext_arr.SetName("Regions")
+            ext_arr.SetName("Epicardium")
             num_ext = self.exterior_mesh.GetNumberOfPoints()
             for _ in range(num_ext):
                 ext_arr.InsertNextValue(0)
@@ -2474,7 +2348,7 @@ class LASegmenter:
             ext_copy.DeepCopy(self.exterior_mesh)
             ext_copy.GetPointData().AddArray(ext_arr)
              # Ensure "Regions" is active on exterior copy too
-            ext_copy.GetPointData().SetActiveScalars("Regions")
+            ext_copy.GetPointData().SetActiveScalars("Epicardium")
 
             # Append
             append = vtk.vtkAppendPolyData()
@@ -2718,22 +2592,17 @@ def main():
             print("  Usage: python LAsegmenter.py /path/to/file.vtk")
             return
         try:
-            root = tk.Tk()
-            root.withdraw()
-            f = filedialog.askopenfilename(filetypes=[("VTK", "*.vtk"), ("Checkpoint", "*.wrk")])
-            root.destroy()
-            if not f:
-                print("No file selected.")
-                return
-            args.file = f
-        except Exception as e:
-            print(f"Error opening file dialog: {e}")
-            print("Usage: python LAsegmenter.py /path/to/file.vtk")
+            if tk:
+                root = tk.Tk()
+                root.withdraw()
+                f = filedialog.askopenfilename(filetypes=[("VTK", "*.vtk"), ("Checkpoint", "*.wrk")])
+                root.destroy()
+                if not f:
+                    return
+                args.file = f
+        except:
+            print("Usage: python LAsegmenter.py [file.vtk|file.wrk]")
             return
-    
-    if args.file is None:
-        print("Error: No file specified")
-        return
     
     interior = LASegmenter(args.file)
     interior.run()
